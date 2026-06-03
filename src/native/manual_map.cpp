@@ -1,7 +1,8 @@
-// manual_map.cpp - Thread hijack injector (TlsAlloc + private stack + register safe)
+// manual_map.cpp - NtCreateThreadEx injector (fresh thread, bypasses Byfron)
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
+#include <winternl.h>
 #include <tlhelp32.h>
 #include <cstdint>
 #include <cstring>
@@ -14,7 +15,7 @@ typedef int32_t i32;
 
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
 
-void die(const char* msg){DWORD c=GetLastError();std::cerr<<"[FATAL] "<<msg<<" (code="<<c<<")"<<std::endl;exit(1);}
+void die(const char* msg){DWORD c=GetLastError();std::cerr<<"[FATAL] "<<msg<<" (code=0x"<<std::hex<<c<<std::dec<<")"<<std::endl;exit(1);}
 void info(const std::string& msg){std::cout<<"[+] "<<msg<<std::endl;}
 void warn(const std::string& msg){std::cout<<"[!] "<<msg<<std::endl;}
 
@@ -78,199 +79,141 @@ bool load_pe(const std::wstring& path,PeData& pe){
     return true;
 }
 
-std::vector<DWORD> get_threads(DWORD pid){
-    std::vector<DWORD> t;
-    HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-    if(s==INVALID_HANDLE_VALUE)return t;
-    THREADENTRY32 e{sizeof(e)};
-    if(Thread32First(s,&e)){do{if(e.th32OwnerProcessID==pid)t.push_back(e.th32ThreadID);}while(Thread32Next(s,&e));}
-    CloseHandle(s);return t;
-}
+// ---- SHELLCODE (fresh thread, TlsAlloc + DllMainCRTStartup) ----
+// Layout: page[0x00]=tls_idx_addr, page[0x08]=dll_base, page[0x10]=entry_addr
+//          page[0x100]=shellcode
 
-// ---- Shellcode helpers ----
-
-static void emit_mov_rip_rel(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target,uint8_t prefix,uint8_t modrm){
-    int32_t disp=(int32_t)(target-(sc_base+sc.size()+7));
-    if(prefix)sc.push_back(prefix);sc.push_back(0x89);sc.push_back(modrm);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp>>(i*8)));
-}
-static void emit_ld_rip_rel(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target,uint8_t prefix,uint8_t modrm){
-    int32_t disp=(int32_t)(target-(sc_base+sc.size()+7));
-    if(prefix)sc.push_back(prefix);sc.push_back(0x8B);sc.push_back(modrm);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp>>(i*8)));
-}
-static void emit_eax_to_rip(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
-    int32_t d=(int32_t)(target-(sc_base+sc.size()+6));
-    sc.push_back(0x89);sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
-}
-static void emit_pushfq_pop_rip(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
-    sc.push_back(0x9C);
-    int32_t d=(int32_t)(target-(sc_base+sc.size()+7));
-    sc.push_back(0x8F);sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
-}
-static void emit_push_rip_pop_rflags(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
-    int32_t d=(int32_t)(target-(sc_base+sc.size()+7));
-    sc.push_back(0xFF);sc.push_back(0x35);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
-    sc.push_back(0x9D);
-}
-
-std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area){
-    uintptr_t save_rax=data_area+0x00,save_rcx=data_area+0x08,save_rdx=data_area+0x10;
-    uintptr_t save_r8=data_area+0x18,save_r9=data_area+0x20,save_r10=data_area+0x28;
-    uintptr_t save_r11=data_area+0x30,save_rfl=data_area+0x38;
-    uintptr_t orig_rip=data_area+0x40,orig_rsp=data_area+0x48;
-    uintptr_t addr_idx=data_area+0x1000,addr_base=data_area+0x1008;
-    uintptr_t addr_entry=data_area+0x1010,addr_tlsa=data_area+0x1018;
-    uintptr_t priv_stack=data_area+0x3000,sc_base=data_area+0x100;
+std::vector<uint8_t> build_shellcode(uintptr_t page_addr){
+    uintptr_t slot_tls   = page_addr + 0x00;
+    uintptr_t slot_base  = page_addr + 0x08;
+    uintptr_t slot_entry = page_addr + 0x10;
+    uintptr_t sc_base    = page_addr + 0x100;
 
     std::vector<uint8_t> sc;
-    sc.push_back(0x48);sc.push_back(0xA3);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
-    emit_mov_rip_rel(sc,sc_base,save_rcx,0x48,0x0D);
-    emit_mov_rip_rel(sc,sc_base,save_rdx,0x48,0x15);
-    emit_mov_rip_rel(sc,sc_base,save_r8,0x4C,0x05);
-    emit_mov_rip_rel(sc,sc_base,save_r9,0x4C,0x0D);
-    emit_mov_rip_rel(sc,sc_base,save_r10,0x4C,0x15);
-    emit_mov_rip_rel(sc,sc_base,save_r11,0x4C,0x1D);
-    emit_pushfq_pop_rip(sc,sc_base,save_rfl);
 
-    sc.push_back(0x48);sc.push_back(0xBC);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(priv_stack>>(i*8)));
-
+    // sub rsp, 0x28
     sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xEC);sc.push_back(0x28);
-    sc.push_back(0x48);sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
-    sc.push_back(0xFF);sc.push_back(0xD0);
-    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);
-    emit_eax_to_rip(sc,sc_base,addr_idx);
 
-    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xEC);sc.push_back(0x28);
-    sc.push_back(0x48);sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_base>>(i*8)));
-    sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0xC8);
-    sc.push_back(0xBA);sc.push_back(0x01);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
-    sc.push_back(0x45);sc.push_back(0x31);sc.push_back(0xC0);
-    sc.push_back(0x48);sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_entry>>(i*8)));
+    // call TlsAlloc()
+    uintptr_t ta=(uintptr_t)TlsAlloc;
+    sc.push_back(0x48);sc.push_back(0xB8);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(ta>>(i*8)));
     sc.push_back(0xFF);sc.push_back(0xD0);
-    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);
 
-    {i32 d=(i32)(orig_rsp-(sc_base+sc.size()+7));
-     sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x25);
+    // Write eax to TLS index pointer: mov rcx,[slot_tls]; mov [rcx],eax
+    {i32 d=(i32)(slot_tls-(sc_base+sc.size()+7));
+     sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x0D);
      for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));}
+    sc.push_back(0x89);sc.push_back(0x01);
 
-    sc.push_back(0x48);sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
-    emit_ld_rip_rel(sc,sc_base,save_rcx,0x48,0x0D);
-    emit_ld_rip_rel(sc,sc_base,save_rdx,0x48,0x15);
-    emit_ld_rip_rel(sc,sc_base,save_r8,0x4C,0x05);
-    emit_ld_rip_rel(sc,sc_base,save_r9,0x4C,0x0D);
-    emit_ld_rip_rel(sc,sc_base,save_r10,0x4C,0x15);
-    emit_ld_rip_rel(sc,sc_base,save_r11,0x4C,0x1D);
-    emit_push_rip_pop_rflags(sc,sc_base,save_rfl);
+    // Call DllMainCRTStartup(base, DLL_PROCESS_ATTACH, NULL)
+    // mov rcx,[slot_base]
+    {i32 d=(i32)(slot_base-(sc_base+sc.size()+7));
+     sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x0D);
+     for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));}
+    // mov edx, 1
+    sc.push_back(0xBA);sc.push_back(0x01);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
+    // xor r8d, r8d
+    sc.push_back(0x45);sc.push_back(0x31);sc.push_back(0xC0);
+    // mov rax,[slot_entry]; call rax
+    {i32 d=(i32)(slot_entry-(sc_base+sc.size()+7));
+     sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x05);
+     for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));}
+    sc.push_back(0xFF);sc.push_back(0xD0);
 
-    sc.push_back(0xFF);sc.push_back(0x25);
-    sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(orig_rip>>(i*8)));
+    // add rsp, 0x28; ret (exit thread cleanly)
+    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);
+    sc.push_back(0xC3);
 
     return sc;
 }
 
-bool inject_via_hijack(HANDLE p,DWORD pid,uintptr_t base,uintptr_t entry_rva,uintptr_t tls_idx_addr){
-    LPVOID mem=VirtualAllocEx(p,nullptr,0x4000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
-    if(!mem){warn("Hijack alloc failed");return false;}
-    uintptr_t da=(uintptr_t)mem;
+// ---- NtCreateThreadEx injection (bypasses Byfron SuspendThread/SetThreadContext detection) ----
 
-    auto sc=build_hijack_shellcode(da);
+#define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER 0x4
+
+typedef NTSTATUS (NTAPI* NtCreateThreadEx_t)(
+    PHANDLE,HANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+
+bool inject_via_ntcreate(HANDLE p,uintptr_t entry_addr,uintptr_t dll_base,uintptr_t tls_idx_addr){
+    static NtCreateThreadEx_t ntCreateThreadEx=nullptr;
+    if(!ntCreateThreadEx){
+        HMODULE ntdll=GetModuleHandleW(L"ntdll.dll");
+        if(!ntdll){warn("ntdll not loaded");return false;}
+        ntCreateThreadEx=(NtCreateThreadEx_t)GetProcAddress(ntdll,"NtCreateThreadEx");
+        if(!ntCreateThreadEx){warn("NtCreateThreadEx not found");return false;}
+    }
+
+    LPVOID page=VirtualAllocEx(p,nullptr,0x1000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    if(!page){warn("Page alloc failed");return false;}
+    uintptr_t pa=(uintptr_t)page;
 
     SIZE_T wr;
-    WriteProcessMemory(p,(LPVOID)(da+0x1000),&tls_idx_addr,8,&wr);
-    WriteProcessMemory(p,(LPVOID)(da+0x1008),&base,8,&wr);
-    uintptr_t ea=base+entry_rva;
-    WriteProcessMemory(p,(LPVOID)(da+0x1010),&ea,8,&wr);
-    uintptr_t ta=(uintptr_t)TlsAlloc;
-    WriteProcessMemory(p,(LPVOID)(da+0x1018),&ta,8,&wr);
+    WriteProcessMemory(p,(LPVOID)(pa+0x00),&tls_idx_addr,8,&wr);
+    WriteProcessMemory(p,(LPVOID)(pa+0x08),&dll_base,8,&wr);
+    WriteProcessMemory(p,(LPVOID)(pa+0x10),&entry_addr,8,&wr);
 
-    WriteProcessMemory(p,(LPVOID)(da+0x100),sc.data(),sc.size(),&wr);
+    auto sc=build_shellcode(pa);
+    WriteProcessMemory(p,(LPVOID)(pa+0x100),sc.data(),sc.size(),&wr);
 
-    std::vector<DWORD> tids=get_threads(pid);
-    info(std::to_string(tids.size())+" threads");
+    HANDLE hThread=nullptr;
+    NTSTATUS st;
 
-    for(int ti=(int)tids.size()-1;ti>=0;ti--){
-        DWORD tid=tids[ti];
-        HANDLE h=OpenThread(THREAD_ALL_ACCESS,FALSE,tid);
-        if(!h)continue;
-        if(SuspendThread(h)==(DWORD)-1){CloseHandle(h);continue;}
-        CONTEXT ctx={};ctx.ContextFlags=CONTEXT_FULL;
-        if(!GetThreadContext(h,&ctx)){ResumeThread(h);CloseHandle(h);continue;}
-
-        WriteProcessMemory(p,(LPVOID)(da+0x40),&ctx.Rip,8,&wr);
-        WriteProcessMemory(p,(LPVOID)(da+0x48),&ctx.Rsp,8,&wr);
-
-        info("Hijacking TID="+std::to_string(tid)+" RIP="+hex_str(ctx.Rip));
-        ctx.Rip=da+0x100;
-        if(SetThreadContext(h,&ctx)){
-            ResumeThread(h);CloseHandle(h);
-            info("Thread hijacked! DllMain on private stack.");
+    for(int attempt=0;attempt<3;attempt++){
+        ULONG flags=(attempt==0)?THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER:0;
+        st=ntCreateThreadEx(&hThread,THREAD_ALL_ACCESS,nullptr,p,
+            (PVOID)(pa+0x100),(PVOID)dll_base,flags,0,0,0,nullptr);
+        if(st>=0&&hThread){
+            info("Thread created (flags="+std::to_string(flags)+
+                 ") TID="+std::to_string(GetThreadId(hThread)));
+            CloseHandle(hThread);
             return true;
         }
-        warn("SetThreadContext failed TID="+std::to_string(tid));
-        ResumeThread(h);CloseHandle(h);
+        warn("NtCreateThreadEx attempt "+std::to_string(attempt+1)+" failed (0x"+hex_str(st)+")");
+        Sleep(100);
     }
-    warn("No hijackable thread");
-    return false;
+
+    warn("NtCreateThreadEx failed, falling back to CreateRemoteThread...");
+    HANDLE crt=CreateRemoteThread(p,nullptr,0,(LPTHREAD_START_ROUTINE)(pa+0x100),(LPVOID)dll_base,0,nullptr);
+    if(!crt){VirtualFreeEx(p,page,0,MEM_RELEASE);return false;}
+    info("CreateRemoteThread TID="+std::to_string(GetThreadId(crt)));
+    CloseHandle(crt);
+    return true;
 }
 
-// ---- TLS setup ----
-// CRITICAL: Read TLS directory from PE FILE (pe.raw), NOT from remote memory.
-// After apply_relocs() the remote copy has absolute addresses. If we read from
-// remote and then do base+(addr-ImageBase) we double-apply the relocation.
-// By reading from the file, all fields are still VA (ImageBase-relative),
-// so our base+(field-ImageBase) computation is correct.
+// ---- TLS setup (read from PE file to avoid double-relocation) ----
 
 bool setup_tls(HANDLE p,uintptr_t base,PeData& pe,uintptr_t* out_idx){
     IMAGE_DATA_DIRECTORY& td=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if(td.Size==0||td.VirtualAddress==0){info("TLS: none");*out_idx=0;return true;}
 
-    // Read from PE FILE (not remote — relocs would mess up our math)
     IMAGE_TLS_DIRECTORY64* tls=(IMAGE_TLS_DIRECTORY64*)(pe.raw.data()+rva_to_ptr(td.VirtualAddress,pe));
-
-    if(!tls->StartAddressOfRawData){info("TLS: empty");
+    if(!tls->StartAddressOfRawData){
         *out_idx=base+(tls->AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
+        info("TLS: empty, index_addr="+hex_str(*out_idx));
         return true;}
 
     size_t ds=(size_t)(tls->EndAddressOfRawData-tls->StartAddressOfRawData);
     size_t zs=tls->SizeOfZeroFill;size_t tot=ds+zs;
     info("TLS: data="+std::to_string(ds)+" zero="+std::to_string(zs)+" total="+std::to_string(tot));
 
-    // AddressOfIndex is a VA — convert to absolute address in mapped DLL
     *out_idx=base+(tls->AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
-    info("TLS: index_addr="+hex_str(*out_idx)+" (file AddressOfIndex="+hex_str(tls->AddressOfIndex)+")");
+    info("TLS: index_addr="+hex_str(*out_idx));
 
     LPVOID blk=VirtualAllocEx(p,nullptr,tot,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     if(!blk){warn("TLS: alloc fail");return false;}
     uintptr_t bp=(uintptr_t)blk;
 
-    // Copy template from file
-    if(ds>0){
-        SIZE_T wr;
-        WriteProcessMemory(p,blk,pe.raw.data()+rva_to_ptr((DWORD)tls->StartAddressOfRawData,pe),ds,&wr);
-    }
+    if(ds>0){SIZE_T wr;WriteProcessMemory(p,blk,pe.raw.data()+rva_to_ptr((DWORD)tls->StartAddressOfRawData,pe),ds,&wr);}
     if(zs>0){std::vector<uint8_t> z(zs,0);SIZE_T wr;WriteProcessMemory(p,(LPVOID)(bp+ds),z.data(),zs,&wr);}
 
-    // NOW update the remote TLS directory with absolute addresses
-    uintptr_t tls_remote_addr=base+td.VirtualAddress;
+    uintptr_t tra=base+td.VirtualAddress;
     IMAGE_TLS_DIRECTORY64 pt={};
-    pt.StartAddressOfRawData=bp;
-    pt.EndAddressOfRawData=bp+tot;
-    pt.SizeOfZeroFill=0;
-    pt.AddressOfIndex=*out_idx;       // keep the computed absolute address
+    pt.StartAddressOfRawData=bp;pt.EndAddressOfRawData=bp+tot;pt.SizeOfZeroFill=0;
+    pt.AddressOfIndex=*out_idx;
     pt.AddressOfCallBacks=base+(tls->AddressOfCallBacks-pe.nt->OptionalHeader.ImageBase);
     pt.Characteristics=tls->Characteristics;
-    SIZE_T wr;WriteProcessMemory(p,(LPVOID)tls_remote_addr,&pt,sizeof(pt),&wr);
+    SIZE_T wr;WriteProcessMemory(p,(LPVOID)tra,&pt,sizeof(pt),&wr);
 
     info("TLS: block @ "+hex_str(bp)+" ("+std::to_string(tot)+" bytes)");
     return true;
@@ -369,14 +312,15 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
     if(entry==0){warn("No entry point");CloseHandle(p);return true;}
     info("Entry RVA: "+hex_str(entry));
 
-    info("Thread hijacking (TlsAlloc + private stack + register safe)...");
-    if(inject_via_hijack(p,pid,base,entry,tls_idx_addr)){
+    info("NtCreateThreadEx (fresh thread, no hijack = no Byfron detection)...");
+    if(inject_via_ntcreate(p,base+entry,base,tls_idx_addr)){
         info("SUCCESS! DLL @ "+hex_str(base));
+        info("New thread, TlsAlloc called before DllMain, TLS index set.");
         info("Log: %TEMP%\\luna_extracted\\"+std::to_string(pid)+"\\runtime.log");
         CloseHandle(p);return true;
     }
     CloseHandle(p);
-    warn("Thread hijack failed.");
+    warn("Injection failed.");
     return false;
 }
 
@@ -397,7 +341,7 @@ bool is_x64_process(DWORD pid){
 }
 
 int wmain(int argc,wchar_t* argv[]){
-    if(argc<3){std::wcout<<L"Manual Map Injector (Hijack + TlsAlloc)\nUsage: manual_map.exe <dll> --process <name>\n";return 1;}
+    if(argc<3){std::wcout<<L"Manual Map Injector (NtCreateThreadEx)\nUsage: manual_map.exe <dll> --process <name>\n";return 1;}
     std::wstring dll;DWORD pid=0;std::wstring pname;
     for(int i=1;i<argc;++i){
         std::wstring a=argv[i];

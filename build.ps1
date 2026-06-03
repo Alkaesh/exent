@@ -38,7 +38,7 @@ Write-Host '  DLL: OK' -ForegroundColor Green
 $deps = & objdump -p "$Bin\luna_extracted_native.dll" 2>&1 | Select-String 'DLL Name'
 Write-Host '  Deps:'
 if ($deps) { $deps | ForEach-Object { Write-Host "    $($_.Line.Trim())" } }
-else { Write-Host '    (none — fully static)' -ForegroundColor Green }
+else { Write-Host '    (none - fully static)' -ForegroundColor Green }
 
 Write-Host '[2/2] Manual Map Injector...'
 if (Test-Path "$Native\manual_map.cpp") {
