@@ -1,7 +1,8 @@
-// manual_map.cpp — Manual map injector (bypasses Byfron/LoadLibraryW detection)
+// manual_map.cpp — Manual map injector (bypasses Byfron)
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -24,6 +25,12 @@ void die(const std::string& msg) {
 
 void info(const std::string& msg) { std::cout << "[+] " << msg << std::endl; }
 void warn(const std::string& msg) { std::cout << "[!] " << msg << std::endl; }
+
+std::string hex_str(uintptr_t v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)v);
+    return std::string(buf);
+}
 
 DWORD find_pid(const std::wstring& name) {
     HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -72,15 +79,12 @@ bool load_pe(const std::wstring& path, PeData& pe) {
 
 std::vector<uint8_t> build_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) {
     uintptr_t dllmain = dll_base + dllmain_rva;
-    std::vector<uint8_t> sc = {
-        0x48, 0x83, 0xEC, 0x28,
-        0x48, 0xB9,
-    };
-    for (int i = 0; i < 8; i++) sc.push_back((dll_base >> (i * 8)) & 0xFF);
+    std::vector<uint8_t> sc = { 0x48, 0x83, 0xEC, 0x28, 0x48, 0xB9 };
+    for (int i = 0; i < 8; i++) sc.push_back((dll_base >> (i*8)) & 0xFF);
     sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
     sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
     sc.push_back(0x48); sc.push_back(0xB8);
-    for (int i = 0; i < 8; i++) sc.push_back((dllmain >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 8; i++) sc.push_back((dllmain >> (i*8)) & 0xFF);
     sc.push_back(0xFF); sc.push_back(0xD0);
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
     sc.push_back(0xC3);
@@ -90,18 +94,15 @@ std::vector<uint8_t> build_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) 
 bool resolve_imports(HANDLE process, uintptr_t base, PeData& pe) {
     IMAGE_DATA_DIRECTORY& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir.Size == 0) { info("No imports"); return true; }
-
     auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
     while (desc->Name != 0) {
         const char* dll_name = (const char*)(pe.raw.data() + rva_to_ptr(desc->Name, pe));
         HMODULE hMod = LoadLibraryA(dll_name);
         if (!hMod) { warn(std::string("Missing: ") + dll_name); desc++; continue; }
         info(std::string("Imports: ") + dll_name);
-
         auto* thunk = (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe));
         auto* orig = desc->OriginalFirstThunk
             ? (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->OriginalFirstThunk, pe)) : thunk;
-
         while (orig->u1.AddressOfData != 0) {
             uintptr_t func_addr = 0;
             if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
@@ -110,8 +111,8 @@ bool resolve_imports(HANDLE process, uintptr_t base, PeData& pe) {
                 auto* nb = (IMAGE_IMPORT_BY_NAME*)(pe.raw.data() + rva_to_ptr((DWORD)orig->u1.AddressOfData, pe));
                 func_addr = (uintptr_t)GetProcAddress(hMod, nb->Name);
             }
-            uintptr_t remote_addr = base + (desc->FirstThunk + (uintptr_t)thunk -
-                (uintptr_t)(IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe)));
+            uintptr_t remote_addr = base + (desc->FirstThunk + (uintptr_t)thunk
+                - (uintptr_t)(IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe)));
             SIZE_T wr;
             WriteProcessMemory(process, (LPVOID)remote_addr, &func_addr, sizeof(func_addr), &wr);
             orig++; thunk++;
@@ -125,14 +126,11 @@ bool apply_relocs(HANDLE process, uintptr_t base, PeData& pe) {
     uintptr_t preferred = pe.nt->OptionalHeader.ImageBase;
     if (base == preferred) { info("No relocs needed"); return true; }
     intptr_t delta = (intptr_t)(base - preferred);
-    info("Relocs delta: 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)delta); return b; }()));
-
+    info("Relocs delta: " + hex_str((uintptr_t)delta));
     IMAGE_DATA_DIRECTORY& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (dir.Size == 0) { warn("No .reloc section"); return false; }
-
     auto* block = (IMAGE_BASE_RELOCATION*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
     uint8_t* end = pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe) + dir.Size;
-
     while ((uint8_t*)block < end && block->SizeOfBlock > 0) {
         DWORD cnt = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
         WORD* entries = (WORD*)(block + 1);
@@ -172,50 +170,42 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     PeData pe;
     if (!load_pe(dll_path, pe)) { std::cerr << "Bad PE" << std::endl; return false; }
     info("PE: " + std::to_string(pe.image_size) + " bytes, " + std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
-
     HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
     if (!p) { std::cerr << "OpenProcess failed — run as ADMIN!" << std::endl; return false; }
     info("Opened PID " + std::to_string(pid));
-
     LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) { die("VirtualAllocEx"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
-    info("Allocated at 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)base); return b; }()));
-
+    info("Allocated at " + hex_str(base));
     SIZE_T wr;
     WriteProcessMemory(p, mem, pe.raw.data(), pe.nt->OptionalHeader.SizeOfHeaders, &wr);
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
         if (s.SizeOfRawData == 0) continue;
-        WriteProcessMemory(p, (LPVOID)(base + s.VirtualAddress),
-            pe.raw.data() + s.PointerToRawData, s.SizeOfRawData, &wr);
+        WriteProcessMemory(p, (LPVOID)(base + s.VirtualAddress), pe.raw.data() + s.PointerToRawData, s.SizeOfRawData, &wr);
     }
     info("Sections mapped");
-
     apply_relocs(p, base, pe);
     resolve_imports(p, base, pe);
     protect_sections(p, base, pe);
-
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
-    if (entry == 0) { warn("No DllMain (entry=0)"); CloseHandle(p); return true; }
-
+    if (entry == 0) { warn("No DllMain"); CloseHandle(p); return true; }
+    info("DllMain RVA: " + hex_str(entry));
     auto sc = build_shellcode(base, entry);
     LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!sc_mem) { die("Shellcode alloc"); CloseHandle(p); return false; }
     WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-
+    info("Shellcode written");
     HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
     if (!t) { die("CreateRemoteThread for DllMain"); CloseHandle(p); return false; }
-
     info("DllMain thread running...");
     WaitForSingleObject(t, 15000);
     DWORD ec; GetExitCodeThread(t, &ec);
     CloseHandle(t);
     VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
     CloseHandle(p);
-
     info("DllMain returned " + std::to_string(ec) + " (" + (ec ? "TRUE)" : "FALSE)"));
-    info("DLL mapped at 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)base); return b; }()));
+    info("DLL mapped at " + hex_str(base));
     return true;
 }
 
@@ -246,7 +236,6 @@ int wmain(int argc, wchar_t* argv[]) {
                    << L"       manual_map.exe <dll> --process <name>\n";
         return 1;
     }
-
     std::wstring dll; DWORD pid = 0; std::wstring pname;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
