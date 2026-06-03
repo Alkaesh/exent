@@ -97,8 +97,7 @@ void dump_sections(const PeData& pe) {
         memcpy(name, s.Name, 8);
         std::string hex_name;
         for (int j = 0; j < 8 && s.Name[j]; j++) {
-            char h[4];
-            snprintf(h, sizeof(h), "%02X ", (unsigned char)s.Name[j]);
+            char h[4]; snprintf(h, sizeof(h), "%02X ", (unsigned char)s.Name[j]);
             hex_name += h;
         }
         info("  [" + std::to_string(i) + "] '" + std::string(name) + "' (" + hex_name +
@@ -122,7 +121,7 @@ bool load_pe(const std::wstring& path, PeData& pe) {
     return true;
 }
 
-// ---- THREAD HIJACKING (bypasses Byfron CreateRemoteThread detection) ----
+// ---- THREAD HIJACKING (bypasses Byfron) ----
 
 std::vector<DWORD> get_process_threads(DWORD pid) {
     std::vector<DWORD> tids;
@@ -131,32 +130,98 @@ std::vector<DWORD> get_process_threads(DWORD pid) {
     THREADENTRY32 te{sizeof(te)};
     if (Thread32First(s, &te)) {
         do {
-            if (te.th32OwnerProcessID == pid)
-                tids.push_back(te.th32ThreadID);
+            if (te.th32OwnerProcessID == pid) tids.push_back(te.th32ThreadID);
         } while (Thread32Next(s, &te));
     }
     CloseHandle(s);
     return tids;
 }
 
-// x64 shellcode that:
-//   sub rsp, 0x28
-//   mov rcx, <dll_base>        ; hinstDLL
-//   mov edx, 1                 ; DLL_PROCESS_ATTACH
-//   xor r8d, r8d               ; reserved = NULL
+// Layout of the shellcode page:
+//   [0x00] save area: 13 x 8 bytes = saved registers (rax, rcx, rdx, r8-r11, rsp, rflags) + padding
+//   [0x80] actual shellcode
+//   [0xC0] original RIP (8 bytes)
+//
+// Shellcode:
+//   mov [save+0x00], rax
+//   mov [save+0x08], rcx
+//   mov [save+0x10], rdx
+//   mov [save+0x18], r8
+//   mov [save+0x20], r9
+//   mov [save+0x28], r10
+//   mov [save+0x30], r11
+//   pushfq; pop [save+0x38]   ; save rflags
+//   sub rsp, 0x28             ; shadow space
+//   and rsp, ~0xF             ; align stack to 16
+//   mov rcx, <base>           ; hinstDLL
+//   mov edx, 1                ; DLL_PROCESS_ATTACH
+//   xor r8d, r8d
 //   mov rax, <dllmain>
 //   call rax
 //   add rsp, 0x28
-//   mov rax, [rip + <offset>]  ; load saved original RIP
-//   jmp rax                    ; return to original code
-std::vector<uint8_t> build_hijack_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) {
+//   mov rax, [save+0x00]      ; restore rax
+//   mov rcx, [save+0x08]
+//   mov rdx, [save+0x10]
+//   mov r8,  [save+0x18]
+//   mov r9,  [save+0x20]
+//   mov r10, [save+0x28]
+//   mov r11, [save+0x30]
+//   push [save+0x38]; popfq   ; restore rflags
+//   jmp [rip+2]               ; absolute indirect jump
+//   int3
+//   <original RIP>            ; 8 bytes
+
+std::vector<uint8_t> build_hijack_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva, uintptr_t save_area) {
     uintptr_t dllmain = dll_base + dllmain_rva;
 
     std::vector<uint8_t> sc;
 
-    // Save volatile registers (rax, rcx, rdx, r8, r9, r10, r11)
-    // and align stack BEFORE calling DllMain
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28); // sub rsp, 0x28
+    // Save registers to save_area (at page start)
+    // mov [save_area+0x00], rax
+    sc.push_back(0x48); sc.push_back(0xA3);
+    for (int i = 0; i < 8; i++) sc.push_back((save_area >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x08], rcx
+    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x0D);
+    uint32_t off = (uint32_t)(save_area + 8);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x10], rdx
+    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x15);
+    off = (uint32_t)(save_area + 0x10);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x18], r8
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x05);
+    off = (uint32_t)(save_area + 0x18);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x20], r9
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x0D);
+    off = (uint32_t)(save_area + 0x20);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x28], r10
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x15);
+    off = (uint32_t)(save_area + 0x28);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov [save_area+0x30], r11
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x1D);
+    off = (uint32_t)(save_area + 0x30);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // pushfq; pop [save_area+0x38]
+    sc.push_back(0x9C);
+    sc.push_back(0x8F); sc.push_back(0x05);
+    off = (uint32_t)(save_area + 0x38);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // sub rsp, 0x28
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
+
+    // and rsp, ~0xF (align stack to 16)
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xE4); sc.push_back(0xF0);
 
     // mov rcx, dll_base
     sc.push_back(0x48); sc.push_back(0xB9);
@@ -179,30 +244,66 @@ std::vector<uint8_t> build_hijack_shellcode(uintptr_t dll_base, uintptr_t dllmai
     // add rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
 
-    // jmp [rip+2]  (the absolute jump below)
-    sc.push_back(0xFF); sc.push_back(0x25); sc.push_back(0x02);
-    sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    // int3 just in case
-    sc.push_back(0xCC);
-    // The 8 bytes at the end are the target address (will be patched)
+    // RESTORE registers
+    // mov rax, [save_area+0x00]
+    sc.push_back(0x48); sc.push_back(0xA1);
+    for (int i = 0; i < 8; i++) sc.push_back((save_area >> (i*8)) & 0xFF);
+
+    // mov rcx, [save_area+0x08]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x0D);
+    off = (uint32_t)(save_area + 8);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov rdx, [save_area+0x10]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x15);
+    off = (uint32_t)(save_area + 0x10);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov r8, [save_area+0x18]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x05);
+    off = (uint32_t)(save_area + 0x18);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov r9, [save_area+0x20]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x0D);
+    off = (uint32_t)(save_area + 0x20);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov r10, [save_area+0x28]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x15);
+    off = (uint32_t)(save_area + 0x28);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // mov r11, [save_area+0x30]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x1D);
+    off = (uint32_t)(save_area + 0x30);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // push [save_area+0x38]; popfq
+    sc.push_back(0xFF); sc.push_back(0x35);
+    off = (uint32_t)(save_area + 0x38);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+    sc.push_back(0x9D);
+
+    // Restore original RSP (saved at save_area+0x40)
+    // mov rsp, [save_area+0x40]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
+    off = (uint32_t)(save_area + 0x40);
+    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
+
+    // jmp to original RIP (stored right after shellcode at RIP_offset area)
+    // ff 25 00 00 00 00 = jmp [rip]
+    sc.push_back(0xFF); sc.push_back(0x25);
+    sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
+    // The 8 bytes here will be patched with original RIP
     for (int i = 0; i < 8; i++) sc.push_back(0x00);
 
     return sc;
 }
 
 bool thread_hijack_inject(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t dllmain_rva) {
-    auto sc = build_hijack_shellcode(dll_base, dllmain_rva);
-    size_t sc_size = sc.size();
-
-    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc_size + 64,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!sc_mem) {
-        warn("Shellcode alloc failed for hijack");
-        return false;
-    }
-
     std::vector<DWORD> tids = get_process_threads(pid);
-    if (tids.empty()) { warn("No threads found"); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+    if (tids.empty()) { warn("No threads found"); return false; }
     info(std::to_string(tids.size()) + " threads found in target");
 
     for (int ti = (int)tids.size() - 1; ti >= 0; ti--) {
@@ -222,39 +323,50 @@ bool thread_hijack_inject(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t dll
             ResumeThread(h); CloseHandle(h); continue;
         }
 
-        // Patch the shellcode: write original RIP into the final 8 bytes
-        // so it becomes: jmp [rip+2]; int3; <original RIP>
-        SIZE_T wr;
-        sc[sc_size - 8] = (uint8_t)(ctx.Rip & 0xFF);
-        sc[sc_size - 7] = (uint8_t)((ctx.Rip >> 8) & 0xFF);
-        sc[sc_size - 6] = (uint8_t)((ctx.Rip >> 16) & 0xFF);
-        sc[sc_size - 5] = (uint8_t)((ctx.Rip >> 24) & 0xFF);
-        sc[sc_size - 4] = (uint8_t)((ctx.Rip >> 32) & 0xFF);
-        sc[sc_size - 3] = (uint8_t)((ctx.Rip >> 40) & 0xFF);
-        sc[sc_size - 2] = (uint8_t)((ctx.Rip >> 48) & 0xFF);
-        sc[sc_size - 1] = (uint8_t)((ctx.Rip >> 56) & 0xFF);
+        // Allocate shellcode page (one per attempt, will leak if not used but fine for injector)
+        size_t page_size = 0x1000;
+        LPVOID sc_mem = VirtualAllocEx(p, nullptr, page_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!sc_mem) {
+            ResumeThread(h); CloseHandle(h); continue;
+        }
 
-        WriteProcessMemory(p, sc_mem, sc.data(), sc_size, &wr);
+        uintptr_t save_area = (uintptr_t)sc_mem;  // 0x00-0x7F for register saves
+
+        auto sc = build_hijack_shellcode(dll_base, dllmain_rva, save_area);
+
+        // Save original RSP at save_area+0x40
+        SIZE_T wr;
+        WriteProcessMemory(p, (LPVOID)(save_area + 0x40), &ctx.Rsp, 8, &wr);
+
+        // Patch original RIP into the last 8 bytes of shellcode
+        size_t sc_size = sc.size();
+        for (int i = 0; i < 8; i++)
+            sc[sc_size - 8 + i] = (uint8_t)((ctx.Rip >> (i * 8)) & 0xFF);
+
+        // Write shellcode starting at save_area + 0x80
+        WriteProcessMemory(p, (LPVOID)(save_area + 0x80), sc.data(), sc_size, &wr);
 
         info("Hijacking TID=" + std::to_string(tid) +
              " RIP=" + hex_str(ctx.Rip) +
-             " -> shellcode @ " + hex_str((uintptr_t)sc_mem));
+             " (registers will be saved & restored)");
 
-        ctx.Rip = (DWORD64)sc_mem;
+        // Redirect RIP to shellcode
+        ctx.Rip = (DWORD64)(save_area + 0x80);
 
         if (SetThreadContext(h, &ctx)) {
             ResumeThread(h);
             CloseHandle(h);
-            info("Thread hijacked! DllMain running in TID=" + std::to_string(tid));
+            info("Thread hijacked! DllMain running, registers preserved.");
             return true;
         }
 
         warn("SetThreadContext failed for TID=" + std::to_string(tid));
+        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
         ResumeThread(h);
         CloseHandle(h);
     }
 
-    VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
     warn("Failed to hijack any thread");
     return false;
 }
@@ -302,7 +414,6 @@ bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
     return true;
 }
 
-// ---- Apply relocations ----
 bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
     uintptr_t pref = pe.nt->OptionalHeader.ImageBase;
     if (base == pref) { info("No relocs"); return true; }
@@ -330,7 +441,6 @@ bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
     return true;
 }
 
-// ---- Protect sections ----
 void protect_sections(HANDLE p, uintptr_t base, PeData& pe) {
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
@@ -345,7 +455,7 @@ void protect_sections(HANDLE p, uintptr_t base, PeData& pe) {
     }
 }
 
-// ==== MAIN INJECTION LOGIC ====
+// ==== MAIN ====
 
 bool manual_map(DWORD pid, const std::wstring& dll_path) {
     PeData pe;
@@ -375,33 +485,23 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
 
     apply_relocs(p, base, pe);
     resolve_imports(p, pid, base, pe);
-
-    // Note: With -static, MinGW uses DllMainCRTStartup as the entry point,
-    // which handles CRT initialization internally before calling DllMain.
-    // The section names /4, /19, etc. are linker-generated debug sections.
-    // No manual CRT init is needed.
-
     protect_sections(p, base, pe);
 
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
     if (entry == 0) { warn("No entry point"); CloseHandle(p); return true; }
     info("Entry point RVA: " + hex_str(entry));
 
-    // Thread hijacking: redirect an existing thread to run DllMain.
-    // This bypasses Byfron's CreateRemoteThread hooks because we don't
-    // create a new thread — we hijack one that already exists.
-    info("Attempting thread hijack (bypasses Byfron)...");
+    info("Thread hijacking (register-safe, bypasses Byfron)...");
     if (thread_hijack_inject(p, pid, base, entry)) {
-        info("DLL injected via thread hijack!");
+        info("DLL injected!");
         info("DLL mapped at " + hex_str(base));
-        info("Check: %TEMP%\\luna_extracted\\" + std::to_string(pid) + "\\runtime.log");
+        info("Check log: %TEMP%\\luna_extracted\\" + std::to_string(pid) + "\\runtime.log");
         CloseHandle(p);
         return true;
     }
 
     CloseHandle(p);
-    warn("All methods failed. Check if Roblox has updated their anti-cheat.");
-    warn("DLL is mapped at " + hex_str(base) + " but not initialized.");
+    warn("Failed. No hijackable thread found.");
     return false;
 }
 
@@ -427,7 +527,7 @@ bool is_x64_process(DWORD pid) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3) {
-        std::wcout << L"Manual Map Injector (thread hijack)\n\n"
+        std::wcout << L"Manual Map Injector (thread hijack, register-safe)\n\n"
                    << L"Usage: manual_map.exe <dll> --pid <id>\n"
                    << L"       manual_map.exe <dll> --process <name>\n";
         return 1;
