@@ -1,4 +1,4 @@
-// manual_map.cpp - Manual map injector (APC + TLS, bypasses Byfron)
+// manual_map.cpp — Manual map injector (APC + TLS, bypasses Byfron)
 // For -static MinGW DLLs: sets up TLS before calling entry point.
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
@@ -67,7 +67,7 @@ void dump_sections(const PeData& pe) {
 }
 
 bool load_pe(const std::wstring& path, PeData& pe) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(path.c_str(), std::ios::binary | std::ios::ate);
     if (!f) return false;
     size_t size = f.tellg(); f.seekg(0); pe.raw.resize(size); f.read((char*)pe.raw.data(), size);
     pe.dos = (IMAGE_DOS_HEADER*)pe.raw.data();
@@ -278,7 +278,7 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
 }
 
 bool is_x64_dll(const std::wstring& p) {
-    std::ifstream f(p, std::ios::binary); if (!f) return false;
+    std::ifstream f(p.c_str(), std::ios::binary); if (!f) return false;
     IMAGE_DOS_HEADER dos; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
     f.seekg(dos.e_lfanew); DWORD sig; f.read((char*)&sig, sizeof(sig));
