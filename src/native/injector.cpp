@@ -1,6 +1,5 @@
-// injector.cpp
-// Compile with MSVC: cl /std:c++17 /EHsc /W4 /O2 injector.cpp /link /OUT:..\..\bin\injector_cli.exe
-// Compile with MinGW:  g++ -std=c++17 -O2 -m64 -municode injector.cpp -static-libgcc -static-libstdc++ -o ..\..\bin\injector_cli.exe
+// injector.cpp — with proper LoadLibraryW validation and Byfron awareness
+// Compile with MinGW: g++ -std=c++17 -O2 -m64 -municode injector.cpp -static -o injector_cli.exe
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -21,43 +20,48 @@ HANDLE create_remote_load_thread(HANDLE process, FARPROC load_library, LPVOID re
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-function-type"
 #endif
-    HANDLE thread = CreateRemoteThread(process, nullptr, 0,
+    return CreateRemoteThread(process, nullptr, 0,
         reinterpret_cast<LPTHREAD_START_ROUTINE>(load_library), remote_address, 0, nullptr);
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-    return thread;
 }
 
 void print_error(const std::string& prefix) {
     DWORD code = GetLastError();
-    LPVOID msgBuffer = nullptr;
+    LPSTR buf = nullptr;
     FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&msgBuffer, 0, nullptr);
-    std::cerr << "[ERROR] " << prefix << " (code=" << code << ")";
-    if (msgBuffer) { std::cerr << ": " << static_cast<char*>(msgBuffer); LocalFree(msgBuffer); }
+        nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&buf, 0, nullptr);
+    std::cerr << "[ERR] " << prefix << " (code=" << code << ")";
+    if (buf) { std::cerr << ": " << buf; LocalFree(buf); }
     std::cerr << std::endl;
 }
 
-void print_info(const std::string& msg) { std::cout << "[INFO] " << msg << std::endl; }
-void print_warn(const std::string& msg) { std::cout << "[WARN] " << msg << std::endl; }
+void info(const std::string& msg) { std::cout << "[OK]  " << msg << std::endl; }
+void warn(const std::string& msg) { std::cout << "[WARN] " << msg << std::endl; }
 
+// WIDE to narrow helper
+std::string ws2s(const std::wstring& ws) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, nullptr, nullptr);
+    s.pop_back();
+    return s;
+}
+
+// Architecture
 enum Arch { ARCH_UNKNOWN, ARCH_X86, ARCH_X64 };
 
 Arch dll_architecture(const std::wstring& path) {
-    std::ifstream file(std::filesystem::path(path), std::ios::binary);
-    if (!file) return ARCH_UNKNOWN;
-    IMAGE_DOS_HEADER dos{};
-    file.read(reinterpret_cast<char*>(&dos), sizeof(dos));
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return ARCH_UNKNOWN;
+    IMAGE_DOS_HEADER dos{}; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return ARCH_UNKNOWN;
-    file.seekg(dos.e_lfanew);
-    DWORD sig = 0;
-    file.read(reinterpret_cast<char*>(&sig), sizeof(sig));
+    f.seekg(dos.e_lfanew);
+    DWORD sig; f.read((char*)&sig, sizeof(sig));
     if (sig != IMAGE_NT_SIGNATURE) return ARCH_UNKNOWN;
-    IMAGE_FILE_HEADER fh{};
-    file.read(reinterpret_cast<char*>(&fh), sizeof(fh));
-    WORD magic = 0;
-    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    IMAGE_FILE_HEADER fh{}; f.read((char*)&fh, sizeof(fh));
+    WORD magic; f.read((char*)&magic, sizeof(magic));
     if (magic == 0x20b) return ARCH_X64;
     if (magic == 0x10b) return ARCH_X86;
     return ARCH_UNKNOWN;
@@ -66,162 +70,143 @@ Arch dll_architecture(const std::wstring& path) {
 Arch process_architecture(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return ARCH_UNKNOWN;
-    BOOL wow64 = FALSE;
-    IsWow64Process(h, &wow64);
-    CloseHandle(h);
-    return wow64 ? ARCH_X86 : ARCH_X64;
+    BOOL w = FALSE; IsWow64Process(h, &w); CloseHandle(h);
+    return w ? ARCH_X86 : ARCH_X64;
 }
 
 const wchar_t* arch_name(Arch a) {
-    switch (a) { case ARCH_X86: return L"32-bit (x86)"; case ARCH_X64: return L"64-bit (x64)"; default: return L"Unknown"; }
+    if (a == ARCH_X86) return L"32-bit";
+    if (a == ARCH_X64) return L"64-bit";
+    return L"?";
 }
 
-bool check_architecture_match(DWORD pid, const std::wstring& dll_path) {
-    std::wcout << L"\n=== Architecture Check ===" << std::endl;
-    Arch pa = process_architecture(pid);
-    Arch da = dll_architecture(dll_path);
-    std::wcout << L"  Process (PID " << pid << L"): " << arch_name(pa) << std::endl;
-    std::wcout << L"  DLL: " << arch_name(da) << std::endl;
+bool check_architecture(DWORD pid, const std::wstring& dll) {
+    std::wcout << L"\n=== Architecture ===" << std::endl;
+    Arch pa = process_architecture(pid), da = dll_architecture(dll);
+    std::wcout << L"  Process: " << arch_name(pa) << L"\n  DLL:     " << arch_name(da) << std::endl;
     if (pa != da || pa == ARCH_UNKNOWN) {
-        std::wcerr << L"  MISMATCH! DLL=" << arch_name(da) << L" Process=" << arch_name(pa) << std::endl;
-        return false;
+        std::wcerr << L"  MISMATCH!" << std::endl; return false;
     }
-    std::wcout << L"  Match: both " << arch_name(pa) << std::endl;
+    std::wcout << L"  OK" << std::endl;
     return true;
 }
 
+// Process
 bool enable_debug_privilege() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) { print_error("OpenProcessToken failed"); return false; }
-    LUID luid;
-    if (!LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) { print_error("LookupPrivilegeValueA failed"); CloseHandle(token); return false; }
-    TOKEN_PRIVILEGES tp;
-    tp.PrivilegeCount = 1; tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr)) { print_error("AdjustTokenPrivileges failed"); CloseHandle(token); return false; }
-    CloseHandle(token);
+    HANDLE t; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &t)) return false;
+    LUID l; LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &l);
+    TOKEN_PRIVILEGES tp{1, l, SE_PRIVILEGE_ENABLED};
+    AdjustTokenPrivileges(t, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    CloseHandle(t);
     return GetLastError() == ERROR_SUCCESS;
 }
 
-DWORD find_process_id(const std::wstring& process_name) {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) { print_error("CreateToolhelp32Snapshot failed"); return 0; }
-    PROCESSENTRY32W entry; entry.dwSize = sizeof(entry);
-    if (!Process32FirstW(snapshot, &entry)) { print_error("Process32FirstW failed"); CloseHandle(snapshot); return 0; }
-    do { if (_wcsicmp(entry.szExeFile, process_name.c_str()) == 0) { CloseHandle(snapshot); return entry.th32ProcessID; }
-    } while (Process32NextW(snapshot, &entry));
-    CloseHandle(snapshot); return 0;
+DWORD find_pid(const std::wstring& name) {
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (s == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W e{sizeof(e)};
+    if (!Process32FirstW(s, &e)) { CloseHandle(s); return 0; }
+    do { if (_wcsicmp(e.szExeFile, name.c_str()) == 0) { CloseHandle(s); return e.th32ProcessID; }
+    } while (Process32NextW(s, &e));
+    CloseHandle(s); return 0;
 }
 
-std::wstring get_file_name(const std::wstring& path) {
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) return path;
-    return path.substr(slash + 1);
+std::wstring basename(const std::wstring& p) {
+    auto i = p.find_last_of(L"\\/");
+    return i == std::wstring::npos ? p : p.substr(i + 1);
 }
 
-bool get_remote_module_base_address(DWORD pid, const std::wstring& module_name, uintptr_t& base_address) {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) return false;
-    MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
-    if (!Module32FirstW(snapshot, &entry)) { CloseHandle(snapshot); return false; }
-    bool found = false;
-    do { if (_wcsicmp(entry.szModule, module_name.c_str()) == 0) { base_address = reinterpret_cast<uintptr_t>(entry.modBaseAddr); found = true; break; }
-    } while (Module32NextW(snapshot, &entry));
-    CloseHandle(snapshot); return found;
+bool remote_module_base(DWORD pid, const std::wstring& name, uintptr_t& base) {
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (s == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W e{sizeof(e)};
+    if (!Module32FirstW(s, &e)) { CloseHandle(s); return false; }
+    do { if (_wcsicmp(e.szModule, name.c_str()) == 0) { base = (uintptr_t)e.modBaseAddr; CloseHandle(s); return true; }
+    } while (Module32NextW(s, &e));
+    CloseHandle(s); return false;
 }
 
-std::optional<std::wstring> normalize_full_path(const std::wstring& path) {
-    DWORD len = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
-    if (len == 0) { print_error("GetFullPathNameW failed"); return std::nullopt; }
-    std::vector<wchar_t> buffer(len);
-    DWORD written = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
-    if (written == 0 || written >= buffer.size()) { print_error("GetFullPathNameW failed"); return std::nullopt; }
-    return std::wstring(buffer.data());
+std::optional<std::wstring> fullpath(const std::wstring& p) {
+    DWORD n = GetFullPathNameW(p.c_str(), 0, nullptr, nullptr);
+    if (!n) return {};
+    std::vector<wchar_t> buf(n);
+    GetFullPathNameW(p.c_str(), n, buf.data(), nullptr);
+    return std::wstring(buf.data());
 }
 
-bool resolve_remote_loadlibrary_address(DWORD pid, uintptr_t& remote_loadlibrary) {
-    HMODULE local_kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!local_kernel32) { print_error("GetModuleHandleW(kernel32.dll) failed"); return false; }
-    FARPROC local_loadlibrary = GetProcAddress(local_kernel32, "LoadLibraryW");
-    if (!local_loadlibrary) { print_error("GetProcAddress(LoadLibraryW) failed"); return false; }
-    uintptr_t remote_kernel32 = 0;
-    if (!get_remote_module_base_address(pid, L"kernel32.dll", remote_kernel32)) { std::cerr << "Failed to locate kernel32.dll in target." << std::endl; return false; }
-    const uintptr_t local_k32_base = reinterpret_cast<uintptr_t>(local_kernel32);
-    const uintptr_t local_ll_addr = reinterpret_cast<uintptr_t>(local_loadlibrary);
-    remote_loadlibrary = remote_kernel32 + (local_ll_addr - local_k32_base);
+bool resolve_loadlibrary(DWORD pid, uintptr_t& addr) {
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return false;
+    FARPROC ll = GetProcAddress(k32, "LoadLibraryW");
+    if (!ll) return false;
+    uintptr_t rk32 = 0;
+    if (!remote_module_base(pid, L"kernel32.dll", rk32)) return false;
+    addr = rk32 + ((uintptr_t)ll - (uintptr_t)k32);
     return true;
 }
 
-bool resolve_remote_export_address(DWORD pid, const std::wstring& dll_path, const char* export_name, uintptr_t& remote_export) {
-    uintptr_t remote_module_base = 0;
-    if (!get_remote_module_base_address(pid, get_file_name(dll_path), remote_module_base)) {
-        std::wcerr << L"DLL not in Toolhelp snapshot (Byfron hides it). Export resolution skipped." << std::endl;
+bool resolve_export(DWORD pid, const std::wstring& dll, const char* exp, uintptr_t& addr) {
+    uintptr_t base = 0;
+    if (!remote_module_base(pid, basename(dll), base)) {
+        warn("DLL hidden from snapshot (Byfron). Export resolution not possible.");
         return false;
     }
-    HMODULE local_module = LoadLibraryExW(dll_path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
-    if (!local_module) { print_error("LoadLibraryExW failed"); return false; }
-    FARPROC local_export = GetProcAddress(local_module, export_name);
-    if (!local_export) { print_error(std::string("GetProcAddress(") + export_name + ") failed"); FreeLibrary(local_module); return false; }
-    const uintptr_t local_base = reinterpret_cast<uintptr_t>(local_module);
-    const uintptr_t export_offset = reinterpret_cast<uintptr_t>(local_export) - local_base;
-    remote_export = remote_module_base + export_offset;
-    FreeLibrary(local_module);
+    HMODULE m = LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (!m) return false;
+    FARPROC e = GetProcAddress(m, exp);
+    if (!e) { FreeLibrary(m); return false; }
+    addr = base + ((uintptr_t)e - (uintptr_t)m);
+    FreeLibrary(m);
     return true;
 }
 
-bool start_remote_runtime(DWORD pid, const std::wstring& dll_path) {
-    uintptr_t remote_start = 0;
-    if (!resolve_remote_export_address(pid, dll_path, "StartRuntimeThreadProc", remote_start)) {
-        print_warn("StartRuntimeThreadProc not resolvable (Byfron hides module). DLL DllMain should self-start.");
-        return false;
-    }
-    HANDLE process = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
-    if (!process) { print_error("OpenProcess for runtime start failed"); return false; }
-    HANDLE thread = create_remote_load_thread(process, reinterpret_cast<FARPROC>(remote_start), nullptr);
-    if (!thread) { print_error("CreateRemoteThread(runtime) failed"); CloseHandle(process); return false; }
-    WaitForSingleObject(thread, INFINITE);
-    DWORD exit_code = 0; GetExitCodeThread(thread, &exit_code);
-    CloseHandle(thread); CloseHandle(process);
-    if (exit_code != 0) { std::cerr << "Runtime start exit code: " << exit_code << std::endl; return false; }
-    print_info("Runtime started via StartRuntimeThreadProc");
+bool start_runtime(DWORD pid, const std::wstring& dll) {
+    uintptr_t start = 0;
+    if (!resolve_export(pid, dll, "StartRuntimeThreadProc", start)) return false;
+    HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
+    if (!p) return false;
+    HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)start, nullptr, 0, nullptr);
+    if (!t) { CloseHandle(p); return false; }
+    WaitForSingleObject(t, INFINITE);
+    DWORD ec; GetExitCodeThread(t, &ec);
+    CloseHandle(t); CloseHandle(p);
+    if (ec != 0) { std::cerr << "Runtime start exit: " << ec << std::endl; return false; }
+    info("Runtime started");
     return true;
 }
 
-std::wstring runtime_base_dir(DWORD pid) {
-    wchar_t temp_path[MAX_PATH] = {};
-    DWORD length = GetTempPathW(MAX_PATH, temp_path);
-    std::wstring base = length ? std::wstring(temp_path, length) : L"C:\\Windows\\Temp\\";
-    if (!base.empty() && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
-    return base + L"\\luna_extracted\\" + std::to_wstring(pid);
+std::wstring runtime_dir(DWORD pid) {
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    std::wstring d(tmp);
+    if (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+    return d + L"\\luna_extracted\\" + std::to_wstring(pid);
 }
 
-std::wstring ready_file_path(DWORD pid) { return runtime_base_dir(pid) + L"\\ready.json"; }
+void clear_runtime(DWORD pid) { std::filesystem::remove_all(runtime_dir(pid)); }
 
-void clear_runtime_artifacts(DWORD pid) {
-    std::error_code ec;
-    std::filesystem::remove_all(runtime_base_dir(pid), ec);
-}
+bool wait_ready(DWORD pid, DWORD timeout) {
+    std::wstring rd = runtime_dir(pid);
+    std::wstring rp = rd + L"\\ready.json";
+    ULONGLONG dl = GetTickCount64() + timeout;
+    info("Waiting for ready.json...");
 
-bool wait_for_runtime_ready_signal(DWORD pid, DWORD timeout_ms) {
-    const std::wstring ready_path = ready_file_path(pid);
-    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
-    print_info("Waiting for runtime ready signal...");
-    while (GetTickCount64() < deadline) {
-        std::ifstream file(std::filesystem::path(ready_path), std::ios::binary);
-        if (file.is_open()) {
-            std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-            if (!data.empty()) {
-                std::cout << "  ready.json content: " << data << std::endl;
-                if (data.find("\"status\": \"runtime_ready\"") != std::string::npos) return true;
-                print_info("ready.json found but status is not runtime_ready. DLL loaded, init may have failed.");
-                return true;
-            }
+    while (GetTickCount64() < dl) {
+        std::ifstream f(rp, std::ios::binary);
+        if (f.is_open()) {
+            std::string d((std::istreambuf_iterator<char>(f)), {});
+            std::cout << "  ready.json: " << d << std::endl;
+            if (d.find("runtime_ready") != std::string::npos) return true;
+            warn("ready.json found but status is not runtime_ready");
+            return true;
         }
-        if (GetTickCount64() >= deadline) {
+        if (GetTickCount64() >= dl) {
             std::error_code ec;
-            if (!std::filesystem::exists(runtime_base_dir(pid), ec)) {
-                std::cerr << "Runtime directory never created! DLL DllMain blocked or failed." << std::endl;
+            if (!std::filesystem::exists(rd, ec)) {
+                std::cerr << "\nRuntime folder never created! DLL blocked by Byfron." << std::endl;
+                std::cerr << "LoadLibrary-based injection is detected and blocked." << std::endl;
+                std::cerr << "You need manual mapping injection to bypass it." << std::endl;
             } else {
-                std::cerr << "Runtime dir exists but no ready.json. Check runtime.log in that folder." << std::endl;
+                std::cerr << "\nRuntime folder exists but no ready.json. Check: " << ws2s(rd) << "\\runtime.log" << std::endl;
             }
             return false;
         }
@@ -230,96 +215,97 @@ bool wait_for_runtime_ready_signal(DWORD pid, DWORD timeout_ms) {
     return false;
 }
 
-bool inject_dll(DWORD pid, const std::wstring& dll_path) {
+bool inject(DWORD pid, const std::wstring& dll) {
     std::cout << "\n=== Injection ===" << std::endl;
 
-    HANDLE process = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
-    if (!process) { print_error("OpenProcess failed. Run as Administrator!"); return false; }
+    HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
+    if (!p) { print_error("OpenProcess — run as ADMIN!"); return false; }
 
-    const SIZE_T dll_path_bytes = (dll_path.size() + 1) * sizeof(wchar_t);
-    LPVOID remote_address = VirtualAllocEx(process, nullptr, dll_path_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote_address) { print_error("VirtualAllocEx failed"); CloseHandle(process); return false; }
+    SIZE_T sz = (dll.size() + 1) * sizeof(wchar_t);
+    LPVOID mem = VirtualAllocEx(p, nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) { print_error("VirtualAllocEx"); CloseHandle(p); return false; }
 
-    SIZE_T written = 0;
-    if (!WriteProcessMemory(process, remote_address, dll_path.c_str(), dll_path_bytes, &written) || written != dll_path_bytes) {
-        print_error("WriteProcessMemory failed");
-        VirtualFreeEx(process, remote_address, 0, MEM_RELEASE); CloseHandle(process); return false;
+    SIZE_T wr;
+    if (!WriteProcessMemory(p, mem, dll.c_str(), sz, &wr) || wr != sz) {
+        print_error("WriteProcessMemory"); VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p); return false;
     }
-    print_info("DLL path written to remote memory");
+    info("Path written to remote process");
 
-    uintptr_t remote_load_library = 0;
-    if (!resolve_remote_loadlibrary_address(pid, remote_load_library)) {
-        VirtualFreeEx(process, remote_address, 0, MEM_RELEASE); CloseHandle(process); return false;
-    }
+    uintptr_t ll = 0;
+    if (!resolve_loadlibrary(pid, ll)) { VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p); return false; }
 
-    print_info("Calling LoadLibraryW...");
-    HANDLE thread = create_remote_load_thread(process, reinterpret_cast<FARPROC>(remote_load_library), remote_address);
-    if (!thread) { print_error("CreateRemoteThread failed"); VirtualFreeEx(process, remote_address, 0, MEM_RELEASE); CloseHandle(process); return false; }
+    info("CreateRemoteThread -> LoadLibraryW...");
+    HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)ll, mem, 0, nullptr);
+    if (!t) { print_error("CreateRemoteThread"); VirtualFreeEx(p, mem, 0, MEM_RELEASE); CloseHandle(p); return false; }
 
-    WaitForSingleObject(thread, INFINITE);
-    DWORD remote_result = 0; GetExitCodeThread(thread, &remote_result);
-    CloseHandle(thread);
-    VirtualFreeEx(process, remote_address, 0, MEM_RELEASE);
-    CloseHandle(process);
+    WaitForSingleObject(t, INFINITE);
+    DWORD res; GetExitCodeThread(t, &res);
+    CloseHandle(t);
+    VirtualFreeEx(p, mem, 0, MEM_RELEASE);
+    CloseHandle(p);
 
-    std::wcout << L"  LoadLibraryW exit: 0x" << std::hex << remote_result << std::dec << std::endl;
+    std::wcout << L"  Exit code: 0x" << std::hex << res << std::dec << std::endl;
 
-    if (remote_result == 0) {
-        std::cerr << "LoadLibraryW returned NULL! Byfron blocked the DLL load." << std::endl;
+    // On x64, valid HMODULEs are in range 0x10000 to 0x00007FFFFFFFFFFF
+    // Anything 0xC0000000+ is an NTSTATUS error — DLL blocked
+    if (res == 0 || res >= 0xC0000000) {
+        std::cerr << "\nLoadLibraryW FAILED! Byfron blocked the DLL." << std::endl;
+        if (res >= 0xC0000000)
+            std::cerr << "Exit code is an NTSTATUS error (0x" << std::hex << res << std::dec << ")." << std::endl;
+        std::cerr << "\nSimple LoadLibrary injection is detected by Byfron." << std::endl;
+        std::cerr << "You need manual mapping: inject the DLL by manually" << std::endl;
+        std::cerr << "allocating memory, writing PE sections, handling relocations" << std::endl;
+        std::cerr << "and imports — without calling LoadLibraryW." << std::endl;
         return false;
     }
 
-    print_info("LoadLibraryW OK. Skipping memory check (Byfron blocks ReadProcessMemory).");
+    info("LoadLibraryW OK");
 
-    uintptr_t dummy = 0;
-    if (get_remote_module_base_address(pid, get_file_name(dll_path), dummy))
-        print_info("Module visible in snapshot");
+    uintptr_t dummy;
+    if (remote_module_base(pid, basename(dll), dummy))
+        info("Module visible in snapshot");
     else
-        print_warn("Module hidden from snapshot (Byfron). Normal, proceeding.");
+        warn("Module hidden (Byfron) — normal");
 
-    if (!start_remote_runtime(pid, dll_path))
-        print_warn("Runtime start via export failed (Byfron). DllMain should self-start.");
-
+    start_runtime(pid, dll); // Try, may fail due to Byfron
     return true;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc < 3) { std::wcout << L"Usage: injector.exe <dll> (--pid <id> | --process <name>) [--debug]\n"; return 1; }
-
-    std::wstring dll_path;
-    DWORD pid = 0;
-    std::wstring process_name;
-    bool enable_debug = false;
-
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = argv[i];
-        if (arg == L"--pid" && i + 1 < argc) pid = static_cast<DWORD>(_wtoi(argv[++i]));
-        else if (arg == L"--process" && i + 1 < argc) process_name = argv[++i];
-        else if (arg == L"--debug") enable_debug = true;
-        else if (dll_path.empty()) dll_path = argv[i];
-    }
-
-    if (dll_path.empty()) { std::cerr << "DLL path required." << std::endl; return 1; }
-    if (!pid && process_name.empty()) { std::cerr << "pid or process required." << std::endl; return 1; }
-
-    auto np = normalize_full_path(dll_path); if (!np) return 1; dll_path = *np;
-    if (GetFileAttributesW(dll_path.c_str()) == INVALID_FILE_ATTRIBUTES) { std::wcerr << L"DLL not found: " << dll_path << std::endl; return 1; }
-    if (enable_debug && !enable_debug_privilege()) { std::cerr << "Debug priv failed." << std::endl; return 1; }
-    if (!pid) { pid = find_process_id(process_name); if (!pid) { std::wcerr << L"Process not found: " << process_name << std::endl; return 1; } }
-
-    if (!check_architecture_match(pid, dll_path)) { std::cerr << "Architecture mismatch." << std::endl; return 1; }
-
-    clear_runtime_artifacts(pid);
-    std::wcout << L"\nInjecting " << get_file_name(dll_path) << L" into PID " << pid << std::endl;
-
-    if (!inject_dll(pid, dll_path)) { std::cerr << "Injection failed." << std::endl; return 1; }
-
-    if (!wait_for_runtime_ready_signal(pid, RUNTIME_READY_TIMEOUT_MS)) {
-        std::cerr << "\nRuntime not confirmed after " << (RUNTIME_READY_TIMEOUT_MS / 1000) << "s." << std::endl;
-        print_info("Check " + std::string(runtime_base_dir(pid).begin(), runtime_base_dir(pid).end()) + "\\runtime.log");
+    if (argc < 3) {
+        std::wcout << L"Usage: injector.exe <dll> (--pid N | --process name) [--debug]\n";
         return 1;
     }
 
-    std::cout << "\nOK! Injection complete!" << std::endl;
+    std::wstring dll; DWORD pid = 0; std::wstring pname; bool dbg = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--pid" && i + 1 < argc) pid = _wtoi(argv[++i]);
+        else if (a == L"--process" && i + 1 < argc) pname = argv[++i];
+        else if (a == L"--debug") dbg = true;
+        else if (dll.empty()) dll = argv[i];
+    }
+
+    if (dll.empty()) { std::cerr << "DLL path required" << std::endl; return 1; }
+    if (!pid && pname.empty()) { std::cerr << "--pid or --process required" << std::endl; return 1; }
+
+    auto fp = fullpath(dll); if (!fp) return 1; dll = *fp;
+    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) { std::wcerr << L"DLL not found" << std::endl; return 1; }
+    if (dbg) enable_debug_privilege();
+    if (!pid) { pid = find_pid(pname); if (!pid) { std::wcerr << L"Process not found" << std::endl; return 1; } }
+
+    if (!check_architecture(pid, dll)) { std::cerr << "Architecture mismatch" << std::endl; return 1; }
+
+    clear_runtime(pid);
+    std::wcout << L"\nInjecting " << basename(dll) << L" into PID " << pid << std::endl;
+
+    if (!inject(pid, dll)) { std::cerr << "\nInjection failed." << std::endl; return 1; }
+
+    if (!wait_ready(pid, RUNTIME_READY_TIMEOUT_MS)) {
+        std::cerr << "\nRuntime not confirmed." << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nOK!" << std::endl;
     return 0;
 }
