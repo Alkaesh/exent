@@ -10,6 +10,8 @@
 #include <iostream>
 #include <fstream>
 
+typedef int32_t i32;
+
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
 
 void die(const char* msg) { DWORD c=GetLastError(); std::cerr<<"[FATAL] "<<msg<<" (code="<<c<<")"<<std::endl; exit(1); }
@@ -84,11 +86,8 @@ std::vector<DWORD> get_threads(DWORD pid){
     CloseHandle(s); return t;
 }
 
-// ---- THREAD HIJACK SHELLCODE ----
-// 3 pages: [save area][shellcode][data][private stack]
-// Shellcode at data_area+0x100. Private stack at data_area+0x2000 growing down.
+// ---- Shellcode helpers ----
 
-// Helper: emit rip-relative mov [rip+disp32], reg (for rcx,rdx,r8-r11)
 static void emit_mov_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
     uintptr_t rip_after = sc_base + sc.size() + 7;
     int32_t disp = (int32_t)(target - rip_after);
@@ -97,13 +96,35 @@ static void emit_mov_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintpt
     for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
 }
 
-// Helper: emit rip-relative mov reg, [rip+disp32]
 static void emit_ld_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
     uintptr_t rip_after = sc_base + sc.size() + 7;
     int32_t disp = (int32_t)(target - rip_after);
     if(prefix) sc.push_back(prefix);
     sc.push_back(0x8B); sc.push_back(modrm);
     for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
+}
+
+static void emit_eax_to_rip(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
+    uintptr_t rip_after = sc_base + sc.size() + 6;
+    int32_t d = (int32_t)(target - rip_after);
+    sc.push_back(0x89); sc.push_back(0x05);
+    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+}
+
+static void emit_pushfq_pop_rip(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
+    sc.push_back(0x9C);
+    uintptr_t rip_after = sc_base + sc.size() + 7;
+    int32_t d = (int32_t)(target - rip_after);
+    sc.push_back(0x8F); sc.push_back(0x05);
+    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+}
+
+static void emit_push_rip_pop_rflags(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
+    uintptr_t rip_after = sc_base + sc.size() + 7;
+    int32_t d = (int32_t)(target - rip_after);
+    sc.push_back(0xFF); sc.push_back(0x35);
+    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+    sc.push_back(0x9D);
 }
 
 std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area) {
@@ -126,44 +147,37 @@ std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area) {
 
     std::vector<uint8_t> sc;
 
-    // == SAVE REGISTERS ==
-    // mov [abs], rax (48 A3 imm64)
+    // Save rax
     sc.push_back(0x48); sc.push_back(0xA3);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
-
+    // Save rcx, rdx, r8-r11
     emit_mov_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
     emit_mov_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
     emit_mov_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
     emit_mov_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
     emit_mov_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
     emit_mov_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
+    // Save rflags
+    emit_pushfq_pop_rip(sc, sc_base, save_rfl);
 
-    // pushfq; pop [rip+disp32]
-    { uintptr_t ra = sc_base + sc.size() + 7;
-      sc.push_back(0x9C); i32 d=(i32)(save_rfl-ra); sc.push_back(0x8F); sc.push_back(0x05);
-      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
-
-    // == SWITCH TO PRIVATE STACK ==
+    // Switch to private stack
     sc.push_back(0x48); sc.push_back(0xBC);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(priv_stack>>(i*8)));
 
-    // == CALL TlsAlloc ==
+    // TlsAlloc()
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
     sc.push_back(0x48); sc.push_back(0xA1);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
     sc.push_back(0xFF); sc.push_back(0xD0);
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
+    // Store TLS index
+    emit_eax_to_rip(sc, sc_base, addr_idx);
 
-    // Write eax (TLS index) -> [addr_idx]
-    { uintptr_t ra = sc_base + sc.size() + 6;
-      i32 d=(i32)(addr_idx-ra); sc.push_back(0x89); sc.push_back(0x05);
-      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
-
-    // == CALL DllMainCRTStartup(base, DLL_PROCESS_ATTACH, NULL) ==
+    // Call DllMainCRTStartup(base, DLL_PROCESS_ATTACH, NULL)
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
     sc.push_back(0x48); sc.push_back(0xA1);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_base>>(i*8)));
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0xC8);  // mov rcx, rax
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0xC8);
     sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
     sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
     sc.push_back(0x48); sc.push_back(0xA1);
@@ -171,29 +185,25 @@ std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area) {
     sc.push_back(0xFF); sc.push_back(0xD0);
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
 
-    // == RESTORE ORIGINAL STACK ==
-    { uintptr_t ra = sc_base + sc.size() + 7;
-      i32 d=(i32)(orig_rsp-ra); sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
+    // Restore original stack
+    { i32 d=(i32)(orig_rsp-(sc_base+sc.size()+7));
+      sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
       for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
 
-    // == RESTORE REGISTERS ==
+    // Restore rax
     sc.push_back(0x48); sc.push_back(0xA1);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
-
+    // Restore rcx,rdx,r8-r11
     emit_ld_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
     emit_ld_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
     emit_ld_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
     emit_ld_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
     emit_ld_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
     emit_ld_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
+    // Restore rflags
+    emit_push_rip_pop_rflags(sc, sc_base, save_rfl);
 
-    // push [save_rfl]; popfq
-    { uintptr_t ra = sc_base + sc.size() + 7;
-      i32 d=(i32)(save_rfl-ra); sc.push_back(0xFF); sc.push_back(0x35);
-      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
-    sc.push_back(0x9D);
-
-    // == JMP TO ORIGINAL RIP ==
+    // Jump to original RIP
     sc.push_back(0xFF); sc.push_back(0x25);
     sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
     for(int i=0;i<8;i++) sc.push_back((uint8_t)(orig_rip>>(i*8)));
@@ -246,8 +256,6 @@ bool inject_via_hijack(HANDLE p,DWORD pid,uintptr_t base,uintptr_t entry_rva,uin
     return false;
 }
 
-// ---- TLS setup ----
-
 bool setup_tls(HANDLE p,uintptr_t base,PeData& pe,uintptr_t* out_idx){
     IMAGE_DATA_DIRECTORY& td=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if(td.Size==0||td.VirtualAddress==0){info("TLS: none");*out_idx=0;return true;}
@@ -282,7 +290,6 @@ bool setup_tls(HANDLE p,uintptr_t base,PeData& pe,uintptr_t* out_idx){
     return true;
 }
 
-// ---- Imports ----
 bool resolve_imports(HANDLE p,DWORD pid,uintptr_t base,PeData& pe){
     auto& dir=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if(dir.Size==0){info("No imports");return true;}
@@ -344,8 +351,6 @@ void protect_sections(HANDLE p,uintptr_t base,PeData& pe){
     }
 }
 
-// ---- Main ----
-
 bool manual_map(DWORD pid,const std::wstring& dll_path){
     PeData pe;
     if(!load_pe(dll_path,pe)){std::cerr<<"[ERROR] Bad PE"<<std::endl;return false;}
@@ -381,7 +386,7 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
     info("Thread hijacking (TlsAlloc + private stack + register safe)...");
     if(inject_via_hijack(p,pid,base,entry,tls_idx_addr)){
         info("SUCCESS! DLL @ "+hex_str(base));
-        info("DllMain runs on private stack, original thread restored after.");
+        info("DllMain runs on private stack, thread restored after.");
         info("Log: %TEMP%\\luna_extracted\\"+std::to_string(pid)+"\\runtime.log");
         CloseHandle(p);return true;
     }
@@ -407,7 +412,7 @@ bool is_x64_process(DWORD pid){
 }
 
 int wmain(int argc,wchar_t* argv[]){
-    if(argc<3){std::wcout<<L"Manual Map Injector (Hijack + TlsAlloc + Private Stack)\nUsage: manual_map.exe <dll> --process <name>\n";return 1;}
+    if(argc<3){std::wcout<<L"Manual Map Injector (Hijack + TlsAlloc)\nUsage: manual_map.exe <dll> --process <name>\n";return 1;}
     std::wstring dll;DWORD pid=0;std::wstring pname;
     for(int i=1;i<argc;++i){
         std::wstring a=argv[i];
