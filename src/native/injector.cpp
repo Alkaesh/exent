@@ -49,6 +49,67 @@ void print_error(const std::string& prefix) {
     std::cerr << std::endl;
 }
 
+// ─── Architecture check ───
+
+enum Arch { ARCH_UNKNOWN, ARCH_X86, ARCH_X64 };
+
+Arch dll_architecture(const std::wstring& path) {
+    std::ifstream file(std::filesystem::path(path), std::ios::binary);
+    if (!file) return ARCH_UNKNOWN;
+    IMAGE_DOS_HEADER dos{};
+    file.read(reinterpret_cast<char*>(&dos), sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return ARCH_UNKNOWN;
+    file.seekg(dos.e_lfanew);
+    DWORD sig = 0;
+    file.read(reinterpret_cast<char*>(&sig), sizeof(sig));
+    if (sig != IMAGE_NT_SIGNATURE) return ARCH_UNKNOWN;
+    IMAGE_FILE_HEADER fh{};
+    file.read(reinterpret_cast<char*>(&fh), sizeof(fh));
+    WORD magic = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    if (magic == 0x20b) return ARCH_X64;
+    if (magic == 0x10b) return ARCH_X86;
+    return ARCH_UNKNOWN;
+}
+
+Arch process_architecture(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return ARCH_UNKNOWN;
+    BOOL wow64 = FALSE;
+    IsWow64Process(h, &wow64);
+    CloseHandle(h);
+    return wow64 ? ARCH_X86 : ARCH_X64;
+}
+
+const wchar_t* arch_name(Arch a) {
+    switch (a) {
+        case ARCH_X86: return L"32-bit (x86)";
+        case ARCH_X64: return L"64-bit (x64)";
+        default: return L"Unknown";
+    }
+}
+
+bool check_architecture_match(DWORD pid, const std::wstring& dll_path) {
+    std::wcout << L"\n═══ Architecture Check ═══" << std::endl;
+    Arch pa = process_architecture(pid);
+    Arch da = dll_architecture(dll_path);
+    std::wcout << L"  Process (PID " << pid << L"): " << arch_name(pa) << std::endl;
+    std::wcout << L"  DLL: " << arch_name(da) << std::endl;
+    if (pa != da || pa == ARCH_UNKNOWN) {
+        std::wcerr << L"  ❌ MISMATCH! DLL is " << arch_name(da) << L", process is " << arch_name(pa) << std::endl;
+        std::wcerr << L"  Fix: recompile DLL for " << arch_name(pa) << std::endl;
+        std::wcerr << L"    MSVC:  /MACHINE:" << (pa == ARCH_X64 ? L"X64" : L"X86") << std::endl;
+        std::wcerr << L"    MinGW: " << (pa == ARCH_X64 ? L"-m64" : L"-m32") << std::endl;
+        std::wcout << L"═════════════════════════" << std::endl;
+        return false;
+    }
+    std::wcout << L"  ✅ Match: both " << arch_name(pa) << std::endl;
+    std::wcout << L"═════════════════════════" << std::endl;
+    return true;
+}
+
+// ─── Original functions ───
+
 bool enable_debug_privilege() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
@@ -311,10 +372,12 @@ bool validate_remote_module_memory(HANDLE process, DWORD remote_result) {
     if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(remote_result)),
                            &dos_header, sizeof(dos_header), &bytes_read) ||
         bytes_read != sizeof(dos_header)) {
+        std::wcerr << L"Cannot read remote memory at HMODULE address." << std::endl;
         return false;
     }
 
     if (dos_header.e_magic != IMAGE_DOS_SIGNATURE || dos_header.e_lfanew <= 0) {
+        std::wcerr << L"Remote memory has no MZ signature — likely architecture mismatch." << std::endl;
         return false;
     }
 
@@ -419,6 +482,9 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path) {
         return false;
     }
 
+    // Show LoadLibraryW result
+    std::wcout << L"  LoadLibraryW exit code: 0x" << std::hex << remote_result << std::dec << std::endl;
+
     const bool remote_memory_valid = validate_remote_module_memory(process, remote_result);
 
     CloseHandle(thread);
@@ -427,21 +493,22 @@ bool inject_dll(DWORD pid, const std::wstring& dll_path) {
     if (remote_result == 0) {
         CloseHandle(process);
         std::cerr << "Remote LoadLibraryW returned NULL." << std::endl;
+        std::cerr << "Possible reasons: 1) DLL dependencies missing (VCRUNTIME?) — use /MT static linking" << std::endl;
+        std::cerr << "  2) Architecture mismatch (check above)  3) Anticheat blocked  4) DllMain bug" << std::endl;
         return false;
     }
 
     HMODULE verified_module = nullptr;
     if (!wait_for_module_loaded(pid, dll_path, MODULE_VERIFY_TIMEOUT_MS, &verified_module)) {
-        std::wcerr << L"Module enumeration did not confirm the DLL after " << MODULE_VERIFY_TIMEOUT_MS
-                   << L" ms. LoadLibraryW returned non-zero, but the module was not observable via Toolhelp snapshot."
-                   << std::endl;
+        std::wcerr << L"Module enumeration did not confirm the DLL after " << MODULE_VERIFY_TIMEOUT_MS << L" ms." << std::endl;
         if (remote_memory_valid) {
             std::wcerr << L"Returned HMODULE points to a valid PE image at 0x"
                        << std::hex << remote_result << std::dec
                        << L". Proceeding with runtime readiness validation." << std::endl;
         } else {
-            std::wcerr << L"Returned HMODULE memory is not a valid PE image. The DLL may have been unloaded immediately, hidden from enumeration, or blocked during initialization. "
-                       << L"Proceeding with runtime readiness validation anyway." << std::endl;
+            std::wcerr << L"Returned HMODULE memory is NOT a valid PE image!" << std::endl;
+            std::wcerr << L"This strongly suggests ARCHITECTURE MISMATCH — the return value is garbage." << std::endl;
+            std::wcerr << L"Proceeding with runtime readiness validation anyway." << std::endl;
         }
         CloseHandle(process);
         start_remote_runtime(pid, dll_path);
@@ -514,6 +581,12 @@ int wmain(int argc, wchar_t* argv[]) {
             std::wcerr << L"Could not find process: " << process_name << std::endl;
             return 1;
         }
+    }
+
+    // ═══ CHECK ARCHITECTURE ═══
+    if (!check_architecture_match(pid, dll_path)) {
+        std::cerr << "\nArchitecture mismatch — injection aborted." << std::endl;
+        return 1;
     }
 
     clear_runtime_artifacts(pid);
