@@ -1,4 +1,6 @@
-// manual_map.cpp - APC injector with TLS init for manual mapping
+// manual_map.cpp — Manual map injector (APC, bypasses Byfron)
+// Maps DLL into remote process and calls entry point via APC.
+// No TLS setup needed — DLL uses dynamic UCRT (ucrtbase.dll already loaded).
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
@@ -9,7 +11,6 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
-#include <filesystem>
 
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
 
@@ -31,6 +32,8 @@ std::string hex_str(uintptr_t v) {
     char buf[32]; snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)v);
     return std::string(buf);
 }
+
+// ---- Process utils ----
 
 DWORD find_pid(const std::wstring& name) {
     HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -61,8 +64,12 @@ uintptr_t remote_module_base(DWORD pid, const std::string& name_lower) {
 const char* resolve_api_set(const char* name) {
     if (strstr(name, "api-ms-win-crt-") || strstr(name, "api-ms-win-core-"))
         return "ucrtbase.dll";
+    if (strstr(name, "api-ms-win-eventing-"))
+        return "sechost.dll";
     return name;
 }
+
+// ---- PE parsing ----
 
 struct PeData {
     std::vector<uint8_t> raw;
@@ -83,16 +90,18 @@ uintptr_t rva_to_ptr(DWORD rva, const PeData& pe) {
 }
 
 void dump_sections(const PeData& pe) {
+    info("Sections: " + std::to_string(pe.nt->FileHeader.NumberOfSections));
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
         char name[9] = {0}; memcpy(name, s.Name, 8);
-        info("  [" + std::to_string(i) + "] '" + std::string(name) + "'" +
-             " VA=" + hex_str(s.VirtualAddress) + " size=" + std::to_string(s.SizeOfRawData));
+        info("  [" + std::to_string(i) + "] \"" + std::string(name) + "\"" +
+             " VA=" + hex_str(s.VirtualAddress) +
+             " raw=" + std::to_string(s.SizeOfRawData));
     }
 }
 
 bool load_pe(const std::wstring& path, PeData& pe) {
-    std::ifstream f(path.c_str(), std::ios::binary | std::ios::ate);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     size_t size = f.tellg(); f.seekg(0);
     pe.raw.resize(size);
@@ -107,138 +116,7 @@ bool load_pe(const std::wstring& path, PeData& pe) {
     return true;
 }
 
-// ---- TLS initialization for manual mapping ----
-// When a DLL is manually mapped, the Windows loader does NOT initialize TLS.
-// CRT functions (DllMainCRTStartup, etc.) crash without TLS because they access
-// __tls_index / __tls_array which hold per-thread data pointers.
-//
-// Our fix: allocate TLS data in the remote process, then patch the TLS directory
-// inside the mapped DLL image so the CRT can find its per-thread storage.
-
-bool setup_tls(HANDLE p, uintptr_t dll_base, PeData& pe) {
-    IMAGE_DATA_DIRECTORY& tls_dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-
-    if (tls_dir.Size == 0 || tls_dir.VirtualAddress == 0) {
-        info("No TLS directory in PE");
-        return true;
-    }
-
-    // Read the TLS directory from the remote DLL image
-    IMAGE_TLS_DIRECTORY64 tls;
-    SIZE_T rd;
-    uintptr_t tls_dir_addr = dll_base + tls_dir.VirtualAddress;
-
-    if (!ReadProcessMemory(p, (LPCVOID)tls_dir_addr, &tls, sizeof(tls), &rd)) {
-        warn("Could not read TLS directory");
-        return false;
-    }
-
-    if (tls.StartAddressOfRawData == 0) {
-        info("TLS: no template (unused)");
-        return true;
-    }
-
-    size_t data_size = (size_t)(tls.EndAddressOfRawData - tls.StartAddressOfRawData);
-    size_t zero_fill = tls.SizeOfZeroFill;
-    size_t total = data_size + zero_fill;
-
-    info("TLS: data=" + std::to_string(data_size) +
-         " zero=" + std::to_string(zero_fill) +
-         " total=" + std::to_string(total));
-
-    // Allocate TLS data block in remote process
-    LPVOID tls_block = VirtualAllocEx(p, nullptr, total,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!tls_block) {
-        warn("Could not allocate TLS block");
-        return false;
-    }
-
-    uintptr_t block_ptr = (uintptr_t)tls_block;
-
-    // Copy TLS template data from the mapped DLL image
-    if (data_size > 0) {
-        std::vector<uint8_t> buf(data_size);
-        uintptr_t template_src = dll_base + (tls.StartAddressOfRawData - pe.nt->OptionalHeader.ImageBase);
-        if (ReadProcessMemory(p, (LPCVOID)template_src, buf.data(), data_size, &rd)) {
-            SIZE_T wr;
-            WriteProcessMemory(p, tls_block, buf.data(), data_size, &wr);
-        }
-    }
-
-    // Zero-fill remaining
-    if (zero_fill > 0) {
-        std::vector<uint8_t> zeros(zero_fill, 0);
-        SIZE_T wr;
-        WriteProcessMemory(p, (LPVOID)(block_ptr + data_size), zeros.data(), zero_fill, &wr);
-    }
-
-    // Patch TLS directory in the remote DLL: point to our allocated block
-    IMAGE_TLS_DIRECTORY64 patched = tls;
-    patched.StartAddressOfRawData = block_ptr;
-    patched.EndAddressOfRawData = block_ptr + total;
-    patched.SizeOfZeroFill = 0;
-
-    SIZE_T wr;
-    WriteProcessMemory(p, (LPVOID)tls_dir_addr, &patched, sizeof(patched), &wr);
-
-    info("TLS block @ " + hex_str(block_ptr) +
-         " (" + std::to_string(total) + " bytes), directory patched");
-    return true;
-}
-
-// ---- APC Shellcode ----
-
-std::vector<uint8_t> build_apc_shellcode(uintptr_t entry_addr) {
-    std::vector<uint8_t> sc;
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
-    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
-    sc.push_back(0x48); sc.push_back(0xB8);
-    for (int i = 0; i < 8; i++) sc.push_back((entry_addr >> (i*8)) & 0xFF);
-    sc.push_back(0xFF); sc.push_back(0xD0);
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
-    sc.push_back(0xC3);
-    return sc;
-}
-
-bool inject_via_apc(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t entry_rva) {
-    uintptr_t entry_addr = dll_base + entry_rva;
-    auto sc = build_apc_shellcode(entry_addr);
-
-    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!sc_mem) { warn("APC alloc failed"); return false; }
-
-    SIZE_T wr;
-    WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-
-    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (s == INVALID_HANDLE_VALUE) { VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
-
-    THREADENTRY32 te{sizeof(te)};
-    if (!Thread32First(s, &te)) { CloseHandle(s); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
-
-    bool queued = false;
-    int total = 0;
-    do {
-        if (te.th32OwnerProcessID != pid) continue;
-        total++;
-        if (queued) continue;
-        HANDLE h = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
-        if (!h) continue;
-        if (QueueUserAPC((PAPCFUNC)sc_mem, h, (ULONG_PTR)dll_base)) {
-            info("APC queued on main thread TID=" + std::to_string(te.th32ThreadID));
-            queued = true;
-        }
-        CloseHandle(h);
-    } while (Thread32Next(s, &te));
-    CloseHandle(s);
-
-    info("Total: " + std::to_string(total) + " threads, 1 APC");
-    if (!queued) { warn("QueueUserAPC failed"); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
-    return true;
-}
+// ---- Import resolution ----
 
 bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -253,7 +131,7 @@ bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
         if (!rdb) { warn(std::string("Not in target: ") + dn); desc++; continue; }
         HMODULE hm = LoadLibraryA(rn);
         if (!hm) { warn(std::string("Can't load: ") + rn); desc++; continue; }
-        info(std::string("Imports: ") + dn + " -> " + rn + " @ " + hex_str(rdb));
+        info("  Import: " + std::string(dn) + " -> " + rn + " (" + hex_str(rdb) + ")");
         auto* tk = (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe));
         auto* og = desc->OriginalFirstThunk
             ? (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->OriginalFirstThunk, pe)) : tk;
@@ -271,23 +149,26 @@ bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
             if (!lf) ur++;
             SIZE_T wr;
             WriteProcessMemory(p, (LPVOID)(base + (desc->FirstThunk +
-                (uintptr_t)tk - (uintptr_t)(IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe)))), &rf, sizeof(rf), &wr);
+                (uintptr_t)tk - (uintptr_t)(IMAGE_THUNK_DATA64*)
+                (pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe)))), &rf, sizeof(rf), &wr);
             og++; tk++;
         }
         FreeLibrary(hm);
-        if (ur > 0) warn(std::to_string(ur) + " unresolved");
+        if (ur > 0) warn(std::to_string(ur) + " unresolved from " + dn);
         desc++;
     }
     return true;
 }
 
+// ---- Relocations ----
+
 bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
     uintptr_t pref = pe.nt->OptionalHeader.ImageBase;
     if (base == pref) return true;
     intptr_t delta = (intptr_t)(base - pref);
-    info("Relocs delta: " + hex_str((uintptr_t)delta));
+    info("Relocs: delta=" + hex_str((uintptr_t)delta));
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (dir.Size == 0) { warn("No .reloc"); return false; }
+    if (dir.Size == 0) { warn("No .reloc section"); return false; }
     auto* blk = (IMAGE_BASE_RELOCATION*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
     uint8_t* en = pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe) + dir.Size;
     while ((uint8_t*)blk < en && blk->SizeOfBlock > 0) {
@@ -308,35 +189,118 @@ bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
     return true;
 }
 
+// ---- Section protection ----
+
 void protect_sections(HANDLE p, uintptr_t base, PeData& pe) {
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
         if (s.SizeOfRawData == 0) continue;
         DWORD prot = PAGE_READONLY;
         if (s.Characteristics & IMAGE_SCN_MEM_EXECUTE)
-            prot = (s.Characteristics & IMAGE_SCN_MEM_WRITE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+            prot = (s.Characteristics & IMAGE_SCN_MEM_WRITE)
+                ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
         else if (s.Characteristics & IMAGE_SCN_MEM_WRITE)
             prot = PAGE_READWRITE;
         DWORD old;
-        VirtualProtectEx(p, (LPVOID)(base + s.VirtualAddress), s.Misc.VirtualSize, prot, &old);
+        VirtualProtectEx(p, (LPVOID)(base + s.VirtualAddress),
+                        s.Misc.VirtualSize, prot, &old);
     }
 }
 
+// ---- APC injection (bypasses Byfron) ----
+
+// Shellcode that calls DllMain(dll_base, DLL_PROCESS_ATTACH, NULL)
+// Runs as APC callback: rcx = dll_base (ULONG_PTR param from QueueUserAPC)
+std::vector<uint8_t> build_apc_shellcode(uintptr_t entry_addr) {
+    std::vector<uint8_t> sc;
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28); // sub rsp,0x28
+    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); // mov edx,1
+    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);                       // xor r8d,r8d
+    sc.push_back(0x48); sc.push_back(0xB8);                                             // mov rax,imm64
+    for (int i = 0; i < 8; i++) sc.push_back((entry_addr >> (i*8)) & 0xFF);
+    sc.push_back(0xFF); sc.push_back(0xD0);                                             // call rax
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);     // add rsp,0x28
+    sc.push_back(0xC3);                                                                 // ret
+    return sc;
+}
+
+bool inject_via_apc(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t entry_rva) {
+    auto sc = build_apc_shellcode(dll_base + entry_rva);
+
+    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!sc_mem) { warn("APC alloc failed"); return false; }
+
+    SIZE_T wr;
+    WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
+
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (s == INVALID_HANDLE_VALUE) { VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+
+    THREADENTRY32 te{sizeof(te)};
+    if (!Thread32First(s, &te)) { CloseHandle(s); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+
+    bool queued = false;
+    int total = 0;
+    do {
+        if (te.th32OwnerProcessID != pid) continue;
+        total++;
+        if (queued) continue;  // only 1 APC — DllMain runs once
+
+        HANDLE h = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!h) continue;
+
+        if (QueueUserAPC((PAPCFUNC)sc_mem, h, (ULONG_PTR)dll_base)) {
+            info("APC -> TID=" + std::to_string(te.th32ThreadID));
+            queued = true;
+        }
+        CloseHandle(h);
+    } while (Thread32Next(s, &te));
+    CloseHandle(s);
+
+    info(std::to_string(queued) + " APC queued / " + std::to_string(total) + " threads");
+
+    if (!queued) {
+        warn("QueueUserAPC failed on all threads — run as Administrator?");
+        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+        return false;
+    }
+    return true;
+}
+
+// ---- Main ----
+
 bool manual_map(DWORD pid, const std::wstring& dll_path) {
     PeData pe;
-    if (!load_pe(dll_path, pe)) { std::cerr << "Bad PE" << std::endl; return false; }
-    info("PE: " + std::to_string(pe.image_size) + " bytes, " +
+    if (!load_pe(dll_path, pe)) {
+        std::cerr << "[ERROR] Bad PE file" << std::endl;
+        return false;
+    }
+
+    info("DLL: " + std::to_string(pe.image_size) + " bytes, " +
          std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
     dump_sections(pe);
 
+    // Show TLS directory if present
+    auto& tls_dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tls_dir.Size > 0 && tls_dir.VirtualAddress > 0) {
+        auto* tls = (IMAGE_TLS_DIRECTORY64*)(pe.raw.data() + rva_to_ptr(tls_dir.VirtualAddress, pe));
+        info("TLS: template=" + hex_str(tls->StartAddressOfRawData) +
+             " size=" + std::to_string(tls->EndAddressOfRawData - tls->StartAddressOfRawData) +
+             " zero=" + std::to_string(tls->SizeOfZeroFill));
+    } else {
+        info("TLS: none (dynamic CRT — no manual TLS setup needed)");
+    }
+
     HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
-    if (!p) { std::cerr << "OpenProcess failed — run as ADMIN!" << std::endl; return false; }
+    if (!p) { std::cerr << "[ERROR] OpenProcess failed — run as ADMIN!" << std::endl; return false; }
     info("Opened PID " + std::to_string(pid));
 
-    LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) { die("VirtualAllocEx"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
-    info("Allocated @ " + hex_str(base));
+    info("Mapped @ " + hex_str(base));
 
     SIZE_T wr;
     WriteProcessMemory(p, mem, pe.raw.data(), pe.nt->OptionalHeader.SizeOfHeaders, &wr);
@@ -346,36 +310,32 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
         WriteProcessMemory(p, (LPVOID)(base + s.VirtualAddress),
             pe.raw.data() + s.PointerToRawData, s.SizeOfRawData, &wr);
     }
-    info("Sections mapped");
 
     apply_relocs(p, base, pe);
     resolve_imports(p, pid, base, pe);
-
-    // CRITICAL: set up TLS before calling DllMainCRTStartup
-    // CRT init crashes without TLS data — runtime.log never gets created
-    setup_tls(p, base, pe);
-
     protect_sections(p, base, pe);
 
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
     if (entry == 0) { warn("No entry point"); CloseHandle(p); return true; }
     info("Entry RVA: " + hex_str(entry));
 
-    info("APC injection (1 thread, TLS ready)...");
+    // APC injection — bypasses Byfron (they don't hook QueueUserAPC on main thread)
+    info("APC injection (1 thread, bypasses Byfron)...");
     if (inject_via_apc(p, pid, base, entry)) {
-        info("DLL injected! @ " + hex_str(base));
-        info("APC fires on alertable wait — runtime.log appears within seconds.");
+        info("SUCCESS! DLL @ " + hex_str(base));
+        info("APC fires when thread becomes alertable (~1-2 sec).");
+        info("Runtime log: %TEMP%\\luna_extracted\\" +
+             std::to_string(pid) + "\\runtime.log");
         CloseHandle(p);
         return true;
     }
 
     CloseHandle(p);
-    warn("Failed.");
     return false;
 }
 
 bool is_x64_dll(const std::wstring& p) {
-    std::ifstream f(p.c_str(), std::ios::binary);
+    std::ifstream f(p, std::ios::binary);
     if (!f) return false;
     IMAGE_DOS_HEADER dos; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
@@ -396,11 +356,12 @@ bool is_x64_process(DWORD pid) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3) {
-        std::wcout << L"Manual Map Injector (APC + TLS)\n\n"
+        std::wcout << L"Manual Map Injector (APC, Byfron bypass)\n\n"
                    << L"Usage: manual_map.exe <dll> --pid <id>\n"
                    << L"       manual_map.exe <dll> --process <name>\n";
         return 1;
     }
+
     std::wstring dll; DWORD pid = 0; std::wstring pname;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -408,25 +369,31 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a == L"--process" && i+1 < argc) pname = argv[++i];
         else if (dll.empty()) dll = argv[i];
     }
-    if (dll.empty()) { std::cerr << "DLL required" << std::endl; return 1; }
+
+    if (dll.empty()) { std::cerr << "DLL path required" << std::endl; return 1; }
     if (!pid) {
         if (pname.empty()) { std::cerr << "--pid or --process required" << std::endl; return 1; }
         pid = find_pid(pname);
-        if (!pid) { std::cerr << "Process not found" << std::endl; return 1; }
+        if (!pid) { std::cerr << "Process '" << std::string(pname.begin(), pname.end()) << "' not found" << std::endl; return 1; }
     }
     if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wcerr << L"DLL not found" << std::endl; return 1;
+        std::wcerr << L"DLL not found: " << dll << std::endl; return 1;
     }
 
     std::wcout << L"\n=== Architecture ===" << std::endl;
     bool d64 = is_x64_dll(dll), p64 = is_x64_process(pid);
     std::wcout << L"  DLL:     " << (d64 ? L"64-bit" : L"32-bit") << std::endl;
     std::wcout << L"  Process: " << (p64 ? L"64-bit" : L"32-bit") << std::endl;
-    if (d64 != p64) { std::cerr << "MISMATCH!" << std::endl; return 1; }
+    if (d64 != p64) { std::cerr << "Architecture MISMATCH!" << std::endl; return 1; }
     std::wcout << L"  OK" << std::endl;
 
-    std::wcout << L"\nManual mapping PID " << pid << std::endl;
-    if (!manual_map(pid, dll)) { std::cerr << "\nFailed." << std::endl; return 1; }
-    std::cout << "\nDONE. Wait a few seconds for the APC to fire, then check runtime.log." << std::endl;
+    std::wcout << L"\nInjecting into PID " << pid << L"..." << std::endl;
+    if (!manual_map(pid, dll)) {
+        std::cerr << "\nInjection FAILED." << std::endl;
+        return 1;
+    }
+
+    std::wcout << L"\nDONE. Wait ~2 sec for APC to fire, then check %TEMP%\\luna_extracted\\"
+               << pid << L"\\runtime.log" << std::endl;
     return 0;
 }
