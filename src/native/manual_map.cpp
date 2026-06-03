@@ -1,10 +1,10 @@
-// manual_map.cpp — Manual map injector with thread hijacking (bypasses Byfron)
+// manual_map.cpp — Manual map injector with APC injection (clean, doesn't corrupt threads)
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
-#include <winternl.h>
 #include <tlhelp32.h>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <iostream>
@@ -66,6 +66,8 @@ const char* resolve_api_set(const char* name) {
     return name;
 }
 
+// ---- PE ----
+
 struct PeData {
     std::vector<uint8_t> raw;
     IMAGE_DOS_HEADER* dos;
@@ -84,23 +86,15 @@ uintptr_t rva_to_ptr(DWORD rva, const PeData& pe) {
     return rva;
 }
 
-std::string get_section_name(IMAGE_SECTION_HEADER& s) {
-    char name[9] = {0};
-    memcpy(name, s.Name, 8);
-    return std::string(name);
-}
-
 void dump_sections(const PeData& pe) {
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
-        char name[9] = {0};
-        memcpy(name, s.Name, 8);
-        std::string hex_name;
+        char name[9] = {0}; memcpy(name, s.Name, 8);
+        std::string hn;
         for (int j = 0; j < 8 && s.Name[j]; j++) {
-            char h[4]; snprintf(h, sizeof(h), "%02X ", (unsigned char)s.Name[j]);
-            hex_name += h;
+            char h[4]; snprintf(h, sizeof(h), "%02X ", (unsigned char)s.Name[j]); hn += h;
         }
-        info("  [" + std::to_string(i) + "] '" + std::string(name) + "' (" + hex_name +
+        info("  [" + std::to_string(i) + "] '" + std::string(name) + "' (" + hn +
              ") VA=" + hex_str(s.VirtualAddress) + " size=" + std::to_string(s.SizeOfRawData));
     }
 }
@@ -121,122 +115,46 @@ bool load_pe(const std::wstring& path, PeData& pe) {
     return true;
 }
 
-// ---- THREAD HIJACKING (bypasses Byfron) ----
+// ---- SHELLCODE ----
 
-std::vector<DWORD> get_process_threads(DWORD pid) {
-    std::vector<DWORD> tids;
-    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (s == INVALID_HANDLE_VALUE) return tids;
-    THREADENTRY32 te{sizeof(te)};
-    if (Thread32First(s, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid) tids.push_back(te.th32ThreadID);
-        } while (Thread32Next(s, &te));
-    }
-    CloseHandle(s);
-    return tids;
-}
-
-// Layout of the shellcode page:
-//   [0x00] save area: 13 x 8 bytes = saved registers (rax, rcx, rdx, r8-r11, rsp, rflags) + padding
-//   [0x80] actual shellcode
-//   [0xC0] original RIP (8 bytes)
+// APC-compatible shellcode. Runs as an APC callback so signature is:
+//   void CALLBACK ApcProc(ULONG_PTR param)
+// The param is the DLL base address.
 //
-// Shellcode:
-//   mov [save+0x00], rax
-//   mov [save+0x08], rcx
-//   mov [save+0x10], rdx
-//   mov [save+0x18], r8
-//   mov [save+0x20], r9
-//   mov [save+0x28], r10
-//   mov [save+0x30], r11
-//   pushfq; pop [save+0x38]   ; save rflags
-//   sub rsp, 0x28             ; shadow space
-//   and rsp, ~0xF             ; align stack to 16
-//   mov rcx, <base>           ; hinstDLL
-//   mov edx, 1                ; DLL_PROCESS_ATTACH
-//   xor r8d, r8d
+// The APC runs on the target thread's stack — safe because APC routines
+// are designed to execute inline on alertable threads.
+//
+//   sub rsp, 0x28              ; shadow space
+//   mov rcx, rcx               ; hinstDLL = param (already in rcx)
+//   mov edx, 1                 ; DLL_PROCESS_ATTACH
+//   xor r8d, r8d               ; reserved
 //   mov rax, <dllmain>
 //   call rax
 //   add rsp, 0x28
-//   mov rax, [save+0x00]      ; restore rax
-//   mov rcx, [save+0x08]
-//   mov rdx, [save+0x10]
-//   mov r8,  [save+0x18]
-//   mov r9,  [save+0x20]
-//   mov r10, [save+0x28]
-//   mov r11, [save+0x30]
-//   push [save+0x38]; popfq   ; restore rflags
-//   jmp [rip+2]               ; absolute indirect jump
-//   int3
-//   <original RIP>            ; 8 bytes
+//   ret
+//
+// NOTE: This calls DllMain directly, NOT the CRT entry point.
+// For -static MinGW DLLs, the entry point IS DllMainCRTStartup which
+// initializes CRT and then calls the user's DllMain.
+// So we call DllMainCRTStartup (the entry point), not the user's DllMain.
 
-std::vector<uint8_t> build_hijack_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva, uintptr_t save_area) {
-    uintptr_t dllmain = dll_base + dllmain_rva;
-
+std::vector<uint8_t> build_apc_shellcode(uintptr_t entry_addr) {
     std::vector<uint8_t> sc;
-
-    // Save registers to save_area (at page start)
-    // mov [save_area+0x00], rax
-    sc.push_back(0x48); sc.push_back(0xA3);
-    for (int i = 0; i < 8; i++) sc.push_back((save_area >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x08], rcx
-    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x0D);
-    uint32_t off = (uint32_t)(save_area + 8);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x10], rdx
-    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x15);
-    off = (uint32_t)(save_area + 0x10);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x18], r8
-    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x05);
-    off = (uint32_t)(save_area + 0x18);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x20], r9
-    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x0D);
-    off = (uint32_t)(save_area + 0x20);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x28], r10
-    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x15);
-    off = (uint32_t)(save_area + 0x28);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov [save_area+0x30], r11
-    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x1D);
-    off = (uint32_t)(save_area + 0x30);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // pushfq; pop [save_area+0x38]
-    sc.push_back(0x9C);
-    sc.push_back(0x8F); sc.push_back(0x05);
-    off = (uint32_t)(save_area + 0x38);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
 
     // sub rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
 
-    // and rsp, ~0xF (align stack to 16)
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xE4); sc.push_back(0xF0);
-
-    // mov rcx, dll_base
-    sc.push_back(0x48); sc.push_back(0xB9);
-    for (int i = 0; i < 8; i++) sc.push_back((dll_base >> (i*8)) & 0xFF);
-
-    // mov edx, 1
+    // rcx already = DLL base (passed as APC param)
+    // mov edx, 1  (DLL_PROCESS_ATTACH)
     sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00);
     sc.push_back(0x00); sc.push_back(0x00);
 
-    // xor r8d, r8d
+    // xor r8d, r8d  (lpReserved = NULL)
     sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
 
-    // mov rax, dllmain
+    // mov rax, entry_addr
     sc.push_back(0x48); sc.push_back(0xB8);
-    for (int i = 0; i < 8; i++) sc.push_back((dllmain >> (i*8)) & 0xFF);
+    for (int i = 0; i < 8; i++) sc.push_back((entry_addr >> (i*8)) & 0xFF);
 
     // call rax
     sc.push_back(0xFF); sc.push_back(0xD0);
@@ -244,78 +162,239 @@ std::vector<uint8_t> build_hijack_shellcode(uintptr_t dll_base, uintptr_t dllmai
     // add rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
 
-    // RESTORE registers
-    // mov rax, [save_area+0x00]
-    sc.push_back(0x48); sc.push_back(0xA1);
-    for (int i = 0; i < 8; i++) sc.push_back((save_area >> (i*8)) & 0xFF);
-
-    // mov rcx, [save_area+0x08]
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x0D);
-    off = (uint32_t)(save_area + 8);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov rdx, [save_area+0x10]
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x15);
-    off = (uint32_t)(save_area + 0x10);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov r8, [save_area+0x18]
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x05);
-    off = (uint32_t)(save_area + 0x18);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov r9, [save_area+0x20]
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x0D);
-    off = (uint32_t)(save_area + 0x20);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov r10, [save_area+0x28]
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x15);
-    off = (uint32_t)(save_area + 0x28);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // mov r11, [save_area+0x30]
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x1D);
-    off = (uint32_t)(save_area + 0x30);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // push [save_area+0x38]; popfq
-    sc.push_back(0xFF); sc.push_back(0x35);
-    off = (uint32_t)(save_area + 0x38);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-    sc.push_back(0x9D);
-
-    // Restore original RSP (saved at save_area+0x40)
-    // mov rsp, [save_area+0x40]
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
-    off = (uint32_t)(save_area + 0x40);
-    for (int i = 0; i < 4; i++) sc.push_back((off >> (i*8)) & 0xFF);
-
-    // jmp to original RIP (stored right after shellcode at RIP_offset area)
-    // ff 25 00 00 00 00 = jmp [rip]
-    sc.push_back(0xFF); sc.push_back(0x25);
-    sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    // The 8 bytes here will be patched with original RIP
-    for (int i = 0; i < 8; i++) sc.push_back(0x00);
+    // ret
+    sc.push_back(0xC3);
 
     return sc;
 }
 
-bool thread_hijack_inject(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t dllmain_rva) {
-    std::vector<DWORD> tids = get_process_threads(pid);
-    if (tids.empty()) { warn("No threads found"); return false; }
-    info(std::to_string(tids.size()) + " threads found in target");
+// ---- INJECTION METHODS ----
 
-    for (int ti = (int)tids.size() - 1; ti >= 0; ti--) {
-        DWORD tid = tids[ti];
-        HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-                              THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
-                              FALSE, tid);
+// Method 1: APC injection via QueueUserAPC — cleanest approach.
+// The target thread must be in an alertable state (most Roblox threads are).
+bool inject_via_apc(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t entry_rva) {
+    uintptr_t entry_addr = dll_base + entry_rva;
+    auto sc = build_apc_shellcode(entry_addr);
+
+    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!sc_mem) {
+        warn("APC shellcode alloc failed");
+        return false;
+    }
+
+    SIZE_T wr;
+    WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
+
+    // Enumerate threads
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (s == INVALID_HANDLE_VALUE) {
+        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    THREADENTRY32 te{sizeof(te)};
+    if (!Thread32First(s, &te)) { CloseHandle(s); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+
+    int total = 0, queued = 0;
+    do {
+        if (te.th32OwnerProcessID != pid) continue;
+        total++;
+
+        HANDLE h = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                              FALSE, te.th32ThreadID);
         if (!h) continue;
 
-        if (SuspendThread(h) == (DWORD)-1 && GetLastError() != ERROR_SUCCESS) {
-            CloseHandle(h); continue;
+        // QueueUserAPC requires THREAD_SET_CONTEXT access
+        DWORD result = QueueUserAPC((PAPCFUNC)sc_mem, h, (ULONG_PTR)dll_base);
+        if (result) {
+            queued++;
+            info("APC queued on TID=" + std::to_string(te.th32ThreadID));
         }
+        CloseHandle(h);
+    } while (Thread32Next(s, &te));
+
+    CloseHandle(s);
+
+    info("APCs queued: " + std::to_string(queued) + " / " + std::to_string(total) + " threads");
+
+    if (queued == 0) {
+        warn("QueueUserAPC failed on all threads — thread may need alertable state");
+        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // APC will execute when thread enters alertable wait.
+    // Most Roblox threads do this regularly (message pump, rendering, etc.)
+    info("APC injection successful! DllMain will run when threads become alertable.");
+    return true;
+}
+
+// Method 2: Thread hijacking with private stack (safe fallback if APC fails)
+bool inject_via_hijack(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t entry_rva) {
+    uintptr_t entry_addr = dll_base + entry_rva;
+
+    // Build shellcode for hijacking.
+    // Layout: [0x00..0xFF] data area; [0x100] shellcode
+    // Data area:
+    //   +0x00: original RIP (8 bytes)
+    //   +0x08: original RSP (8 bytes)
+    //   +0x18: saved RAX
+    //   +0x20: saved RCX
+    //   +0x28: saved RDX
+    //   +0x30: saved R8
+    //   +0x38: saved R9
+    //   +0x40: saved R10
+    //   +0x48: saved R11
+    //   +0x50: saved RFLAGS
+
+    // Shellcode at +0x100 (absolute addresses — we know sc_mem):
+    // We'll build it once we know sc_mem.
+
+    // Shellcode:
+    //   Save all regs to data area
+    //   Switch to new stack (allocated separately)
+    //   Call entry point
+    //   Restore regs and orig stack
+    //   jmp to orig RIP
+
+    size_t page_size = 0x2000;  // 2 pages: one for data+shellcode, one for new stack
+    LPVOID sc_mem = VirtualAllocEx(p, nullptr, page_size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!sc_mem) {
+        warn("Hijack alloc failed");
+        return false;
+    }
+
+    uintptr_t data_area = (uintptr_t)sc_mem;
+    uintptr_t shellcode_addr = data_area + 0x100;
+    uintptr_t new_stack_top = data_area + 0x1000;  // second page as private stack
+
+    // Build shellcode with absolute addresses
+    std::vector<uint8_t> sc;
+
+    // Save regs
+    // mov [data+0x18], rax
+    sc.push_back(0x48); sc.push_back(0xA3);
+    for (int i = 0; i < 8; i++) sc.push_back((uint8_t)((data_area + 0x18) >> (i*8)));
+    // mov [data+0x20], rcx
+    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x0D);
+    { uint32_t o = (uint32_t)(data_area + 0x20); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov [data+0x28], rdx
+    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x15);
+    { uint32_t o = (uint32_t)(data_area + 0x28); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov [data+0x30], r8
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x05);
+    { uint32_t o = (uint32_t)(data_area + 0x30); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov [data+0x38], r9
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x0D);
+    { uint32_t o = (uint32_t)(data_area + 0x38); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov [data+0x40], r10
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x15);
+    { uint32_t o = (uint32_t)(data_area + 0x40); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov [data+0x48], r11
+    sc.push_back(0x4C); sc.push_back(0x89); sc.push_back(0x1D);
+    { uint32_t o = (uint32_t)(data_area + 0x48); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // pushfq; pop [data+0x50]
+    sc.push_back(0x9C); sc.push_back(0x8F); sc.push_back(0x05);
+    { uint32_t o = (uint32_t)(data_area + 0x50); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+
+    // Save original RSP to data+0x08
+    // mov [data+0x08], rsp
+    sc.push_back(0x48); sc.push_back(0x89); sc.push_back(0x25);
+    { uint32_t o = (uint32_t)(data_area + 0x08); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+
+    // Switch to private stack
+    // mov rsp, new_stack_top
+    sc.push_back(0x48); sc.push_back(0xBC);
+    for (int i = 0; i < 8; i++) sc.push_back((uint8_t)(new_stack_top >> (i*8)));
+
+    // sub rsp, 0x28 (shadow space)
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
+
+    // mov rcx, dll_base
+    sc.push_back(0x48); sc.push_back(0xB9);
+    for (int i = 0; i < 8; i++) sc.push_back((uint8_t)(dll_base >> (i*8)));
+
+    // mov edx, 1
+    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
+
+    // xor r8d, r8d
+    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
+
+    // mov rax, entry_addr
+    sc.push_back(0x48); sc.push_back(0xB8);
+    for (int i = 0; i < 8; i++) sc.push_back((uint8_t)(entry_addr >> (i*8)));
+
+    // call rax
+    sc.push_back(0xFF); sc.push_back(0xD0);
+
+    // add rsp, 0x28
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
+
+    // Restore original RSP
+    // mov rsp, [data+0x08]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
+    { uint32_t o = (uint32_t)(data_area + 0x08); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+
+    // Restore regs
+    // mov rax, [data+0x18]
+    sc.push_back(0x48); sc.push_back(0xA1);
+    for (int i = 0; i < 8; i++) sc.push_back((uint8_t)((data_area + 0x18) >> (i*8)));
+    // mov rcx, [data+0x20]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x0D);
+    { uint32_t o = (uint32_t)(data_area + 0x20); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov rdx, [data+0x28]
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x15);
+    { uint32_t o = (uint32_t)(data_area + 0x28); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov r8, [data+0x30]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x05);
+    { uint32_t o = (uint32_t)(data_area + 0x30); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov r9, [data+0x38]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x0D);
+    { uint32_t o = (uint32_t)(data_area + 0x38); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov r10, [data+0x40]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x15);
+    { uint32_t o = (uint32_t)(data_area + 0x40); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // mov r11, [data+0x48]
+    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x1D);
+    { uint32_t o = (uint32_t)(data_area + 0x48); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    // push [data+0x50]; popfq
+    sc.push_back(0xFF); sc.push_back(0x35);
+    { uint32_t o = (uint32_t)(data_area + 0x50); for (int i = 0; i < 4; i++) sc.push_back((uint8_t)(o >> (i*8))); }
+    sc.push_back(0x9D);
+
+    // jmp to original RIP (absolute indirect)
+    // ff 25 00 00 00 00 ; jmp [rip+0]
+    sc.push_back(0xFF); sc.push_back(0x25);
+    sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
+    // 8 bytes: original RIP (patched per-thread)
+    for (int i = 0; i < 8; i++) sc.push_back(0x00);
+
+    // Find a thread to hijack
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) { VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+
+    THREADENTRY32 te{sizeof(te)};
+    if (!Thread32First(snap, &te)) { CloseHandle(snap); VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE); return false; }
+
+    bool success = false;
+    int thread_count = 0;
+    std::vector<DWORD> tids;
+    do {
+        if (te.th32OwnerProcessID == pid) { tids.push_back(te.th32ThreadID); thread_count++; }
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+
+    info(std::to_string(thread_count) + " threads, trying hijack with private stack...");
+
+    // Try threads from last to first (worker threads are usually at the end)
+    for (int ti = (int)tids.size() - 1; ti >= 0 && !success; ti--) {
+        DWORD tid = tids[ti];
+        HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, tid);
+        if (!h) continue;
+
+        if (SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
 
         CONTEXT ctx = {};
         ctx.ContextFlags = CONTEXT_FULL;
@@ -323,55 +402,44 @@ bool thread_hijack_inject(HANDLE p, DWORD pid, uintptr_t dll_base, uintptr_t dll
             ResumeThread(h); CloseHandle(h); continue;
         }
 
-        // Allocate shellcode page (one per attempt, will leak if not used but fine for injector)
-        size_t page_size = 0x1000;
-        LPVOID sc_mem = VirtualAllocEx(p, nullptr, page_size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!sc_mem) {
-            ResumeThread(h); CloseHandle(h); continue;
-        }
+        // Write original RIP and RSP to data area
+        SIZE_T wr2;
+        WriteProcessMemory(p, (LPVOID)(data_area + 0x00), &ctx.Rip, 8, &wr2);
+        WriteProcessMemory(p, (LPVOID)(data_area + 0x08), &ctx.Rsp, 8, &wr2);
 
-        uintptr_t save_area = (uintptr_t)sc_mem;  // 0x00-0x7F for register saves
-
-        auto sc = build_hijack_shellcode(dll_base, dllmain_rva, save_area);
-
-        // Save original RSP at save_area+0x40
-        SIZE_T wr;
-        WriteProcessMemory(p, (LPVOID)(save_area + 0x40), &ctx.Rsp, 8, &wr);
-
-        // Patch original RIP into the last 8 bytes of shellcode
+        // Patch the jmp target (last 8 bytes of shellcode)
         size_t sc_size = sc.size();
         for (int i = 0; i < 8; i++)
             sc[sc_size - 8 + i] = (uint8_t)((ctx.Rip >> (i * 8)) & 0xFF);
 
-        // Write shellcode starting at save_area + 0x80
-        WriteProcessMemory(p, (LPVOID)(save_area + 0x80), sc.data(), sc_size, &wr);
+        WriteProcessMemory(p, (LPVOID)shellcode_addr, sc.data(), sc_size, &wr2);
 
         info("Hijacking TID=" + std::to_string(tid) +
              " RIP=" + hex_str(ctx.Rip) +
-             " (registers will be saved & restored)");
+             " (private stack @ " + hex_str(new_stack_top) + ")");
 
-        // Redirect RIP to shellcode
-        ctx.Rip = (DWORD64)(save_area + 0x80);
+        ctx.Rip = (DWORD64)shellcode_addr;
+        // Don't change RSP — the shellcode switches to its own stack
 
         if (SetThreadContext(h, &ctx)) {
             ResumeThread(h);
-            CloseHandle(h);
-            info("Thread hijacked! DllMain running, registers preserved.");
-            return true;
+            info("Thread hijacked! DLL runs on private stack, original stack untouched.");
+            success = true;
+        } else {
+            ResumeThread(h);
+            warn("SetThreadContext failed for TID=" + std::to_string(tid));
         }
-
-        warn("SetThreadContext failed for TID=" + std::to_string(tid));
-        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
-        ResumeThread(h);
         CloseHandle(h);
     }
 
-    warn("Failed to hijack any thread");
-    return false;
+    if (!success) {
+        VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+    }
+    return success;
 }
 
-// ---- Resolve imports ----
+// ---- Standard stuff ----
+
 bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir.Size == 0) { info("No imports"); return true; }
@@ -416,7 +484,7 @@ bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
 
 bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
     uintptr_t pref = pe.nt->OptionalHeader.ImageBase;
-    if (base == pref) { info("No relocs"); return true; }
+    if (base == pref) { return true; }
     intptr_t delta = (intptr_t)(base - pref);
     info("Relocs delta: " + hex_str((uintptr_t)delta));
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
@@ -491,17 +559,27 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     if (entry == 0) { warn("No entry point"); CloseHandle(p); return true; }
     info("Entry point RVA: " + hex_str(entry));
 
-    info("Thread hijacking (register-safe, bypasses Byfron)...");
-    if (thread_hijack_inject(p, pid, base, entry)) {
-        info("DLL injected!");
+    // Method 1: APC injection — cleanest, doesn't corrupt threads
+    info("Trying APC injection (clean, alertable threads)...");
+    if (inject_via_apc(p, pid, base, entry)) {
+        info("DLL injected via APC!");
         info("DLL mapped at " + hex_str(base));
-        info("Check log: %TEMP%\\luna_extracted\\" + std::to_string(pid) + "\\runtime.log");
+        info("APCs fire when threads enter alertable wait (message pump, SleepEx, etc.)");
+        CloseHandle(p);
+        return true;
+    }
+
+    // Method 2: Hijack with private stack — doesn't corrupt original thread
+    warn("APC failed, trying hijack with private stack...");
+    if (inject_via_hijack(p, pid, base, entry)) {
+        info("DLL injected via hijack (private stack)!");
+        info("DLL mapped at " + hex_str(base));
         CloseHandle(p);
         return true;
     }
 
     CloseHandle(p);
-    warn("Failed. No hijackable thread found.");
+    warn("All injection methods failed.");
     return false;
 }
 
@@ -527,7 +605,7 @@ bool is_x64_process(DWORD pid) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3) {
-        std::wcout << L"Manual Map Injector (thread hijack, register-safe)\n\n"
+        std::wcout << L"Manual Map Injector (APC + hijack)\n\n"
                    << L"Usage: manual_map.exe <dll> --pid <id>\n"
                    << L"       manual_map.exe <dll> --process <name>\n";
         return 1;
