@@ -40,7 +40,6 @@ void print_error(const std::string& prefix) {
 void info(const std::string& msg) { std::cout << "[OK]  " << msg << std::endl; }
 void warn(const std::string& msg) { std::cout << "[WARN] " << msg << std::endl; }
 
-// WIDE to narrow helper
 std::string ws2s(const std::wstring& ws) {
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
     std::string s(len, '\0');
@@ -53,7 +52,7 @@ std::string ws2s(const std::wstring& ws) {
 enum Arch { ARCH_UNKNOWN, ARCH_X86, ARCH_X64 };
 
 Arch dll_architecture(const std::wstring& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path.c_str(), std::ios::binary);
     if (!f) return ARCH_UNKNOWN;
     IMAGE_DOS_HEADER dos{}; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return ARCH_UNKNOWN;
@@ -191,7 +190,7 @@ bool wait_ready(DWORD pid, DWORD timeout) {
     info("Waiting for ready.json...");
 
     while (GetTickCount64() < dl) {
-        std::ifstream f(rp, std::ios::binary);
+        std::ifstream f(rp.c_str(), std::ios::binary);
         if (f.is_open()) {
             std::string d((std::istreambuf_iterator<char>(f)), {});
             std::cout << "  ready.json: " << d << std::endl;
@@ -246,36 +245,25 @@ bool inject(DWORD pid, const std::wstring& dll) {
 
     std::wcout << L"  Exit code: 0x" << std::hex << res << std::dec << std::endl;
 
-    // On x64, valid HMODULEs are in range 0x10000 to 0x00007FFFFFFFFFFF
-    // Anything 0xC0000000+ is an NTSTATUS error — DLL blocked
     if (res == 0 || res >= 0xC0000000) {
         std::cerr << "\nLoadLibraryW FAILED! Byfron blocked the DLL." << std::endl;
         if (res >= 0xC0000000)
             std::cerr << "Exit code is an NTSTATUS error (0x" << std::hex << res << std::dec << ")." << std::endl;
         std::cerr << "\nSimple LoadLibrary injection is detected by Byfron." << std::endl;
-        std::cerr << "You need manual mapping: inject the DLL by manually" << std::endl;
-        std::cerr << "allocating memory, writing PE sections, handling relocations" << std::endl;
-        std::cerr << "and imports — without calling LoadLibraryW." << std::endl;
+        std::cerr << "You need manual mapping injection to bypass it." << std::endl;
         return false;
     }
 
     info("LoadLibraryW OK");
-
     uintptr_t dummy;
-    if (remote_module_base(pid, basename(dll), dummy))
-        info("Module visible in snapshot");
-    else
-        warn("Module hidden (Byfron) — normal");
-
-    start_runtime(pid, dll); // Try, may fail due to Byfron
+    if (remote_module_base(pid, basename(dll), dummy)) info("Module visible in snapshot");
+    else warn("Module hidden (Byfron) — normal");
+    start_runtime(pid, dll);
     return true;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc < 3) {
-        std::wcout << L"Usage: injector.exe <dll> (--pid N | --process name) [--debug]\n";
-        return 1;
-    }
+    if (argc < 3) { std::wcout << L"Usage: injector.exe <dll> (--pid N | --process name) [--debug]\n"; return 1; }
 
     std::wstring dll; DWORD pid = 0; std::wstring pname; bool dbg = false;
     for (int i = 1; i < argc; ++i) {
@@ -285,7 +273,6 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a == L"--debug") dbg = true;
         else if (dll.empty()) dll = argv[i];
     }
-
     if (dll.empty()) { std::cerr << "DLL path required" << std::endl; return 1; }
     if (!pid && pname.empty()) { std::cerr << "--pid or --process required" << std::endl; return 1; }
 
@@ -301,10 +288,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (!inject(pid, dll)) { std::cerr << "\nInjection failed." << std::endl; return 1; }
 
-    if (!wait_ready(pid, RUNTIME_READY_TIMEOUT_MS)) {
-        std::cerr << "\nRuntime not confirmed." << std::endl;
-        return 1;
-    }
+    if (!wait_ready(pid, RUNTIME_READY_TIMEOUT_MS)) { std::cerr << "\nRuntime not confirmed." << std::endl; return 1; }
 
     std::cout << "\nOK!" << std::endl;
     return 0;
