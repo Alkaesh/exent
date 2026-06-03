@@ -101,7 +101,7 @@ void dump_sections(const PeData& pe) {
 }
 
 bool load_pe(const std::wstring& path, PeData& pe) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(path.c_str(), std::ios::binary | std::ios::ate);
     if (!f) return false;
     size_t size = f.tellg(); f.seekg(0);
     pe.raw.resize(size);
@@ -335,7 +335,7 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
 }
 
 bool is_x64_dll(const std::wstring& p) {
-    std::ifstream f(p, std::ios::binary);
+    std::ifstream f(p.c_str(), std::ios::binary);
     if (!f) return false;
     IMAGE_DOS_HEADER dos; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
