@@ -75,7 +75,6 @@ bool load_pe(const std::wstring& path,PeData& pe){
     return true;
 }
 
-// ---- Thread enumeration ----
 std::vector<DWORD> get_threads(DWORD pid){
     std::vector<DWORD> t;
     HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
@@ -85,14 +84,29 @@ std::vector<DWORD> get_threads(DWORD pid){
     CloseHandle(s); return t;
 }
 
-// ---- THREAD HIJACKING SHELLCODE ----
-// Layout (3 pages = 0x3000 allocated at data_area):
-//   [0x0000-0x00FF] save area
-//   [0x0100-0x0FFF] shellcode
-//   [0x1000-0x1FFF] data (addresses stored here for shellcode to load)
-//   [0x2000-0x2FFF] private stack (grows down from top)
+// ---- THREAD HIJACK SHELLCODE ----
+// 3 pages: [save area][shellcode][data][private stack]
+// Shellcode at data_area+0x100. Private stack at data_area+0x2000 growing down.
 
-std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area){
+// Helper: emit rip-relative mov [rip+disp32], reg (for rcx,rdx,r8-r11)
+static void emit_mov_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
+    uintptr_t rip_after = sc_base + sc.size() + 7;
+    int32_t disp = (int32_t)(target - rip_after);
+    if(prefix) sc.push_back(prefix);
+    sc.push_back(0x89); sc.push_back(modrm);
+    for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
+}
+
+// Helper: emit rip-relative mov reg, [rip+disp32]
+static void emit_ld_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
+    uintptr_t rip_after = sc_base + sc.size() + 7;
+    int32_t disp = (int32_t)(target - rip_after);
+    if(prefix) sc.push_back(prefix);
+    sc.push_back(0x8B); sc.push_back(modrm);
+    for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
+}
+
+std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area) {
     uintptr_t save_rax  = data_area + 0x00;
     uintptr_t save_rcx  = data_area + 0x08;
     uintptr_t save_rdx  = data_area + 0x10;
@@ -101,227 +115,107 @@ std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area){
     uintptr_t save_r10  = data_area + 0x28;
     uintptr_t save_r11  = data_area + 0x30;
     uintptr_t save_rfl  = data_area + 0x38;
-    uintptr_t orig_rip  = data_area + 0x40;  // patched per-thread
-    uintptr_t orig_rsp  = data_area + 0x48;  // patched per-thread
-    uintptr_t addr_idx  = data_area + 0x1000; // AddressOfIndex (patched)
-    uintptr_t addr_base = data_area + 0x1008; // dll_base (patched)
-    uintptr_t addr_entry= data_area + 0x1010; // entry point (patched)
-    uintptr_t addr_tlsa = data_area + 0x1018; // TlsAlloc addr (patched)
-    uintptr_t priv_stack_top = data_area + 0x3000;
-
-    // Helper: emit "mov [abs64], reg64" (op=0x89, ModRM)
-    auto emit_save_reg = [&](uintptr_t addr, uint8_t modrm) {
-        sc.push_back(0x48);
-        if(modrm==0x05||modrm==0x0D||modrm==0x15||modrm==0x1D||modrm==0x25||modrm==0x2D||modrm==0x35||modrm==0x3D){
-            // RIP-relative form: prefix + op + modrm + 4-byte displacement
-            uint32_t o=(uint32_t)addr; sc.push_back(0x89); sc.push_back(modrm);
-            for(int i=0;i<4;i++)sc.push_back((uint8_t)(o>>(i*8)));
-        }else{
-            // absolute mov [abs64], rax: 48 A3 <addr>
-            sc.push_back(0xA3);
-            for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr>>(i*8)));
-        }
-    };
+    uintptr_t orig_rip  = data_area + 0x40;
+    uintptr_t orig_rsp  = data_area + 0x48;
+    uintptr_t addr_idx  = data_area + 0x1000;
+    uintptr_t addr_base = data_area + 0x1008;
+    uintptr_t addr_entry= data_area + 0x1010;
+    uintptr_t addr_tlsa = data_area + 0x1018;
+    uintptr_t priv_stack= data_area + 0x3000;
+    uintptr_t sc_base   = data_area + 0x100;
 
     std::vector<uint8_t> sc;
 
-    // == SAVE ALL REGISTERS ==
-    // mov [save_rax], rax  (48 A3 ...)
+    // == SAVE REGISTERS ==
+    // mov [abs], rax (48 A3 imm64)
     sc.push_back(0x48); sc.push_back(0xA3);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
 
-    // mov [rip+disp], rcx/rdx/r8/r9/r10/r11
-    // These use RIP-relative addressing because 32-bit signed offsets fit
-    // We'll compute offsets from the save instruction's RIP
-    // Actually, simpler: use ABSOLUTE 64-bit addressing via mov r/m64, r64 with SIB
-    // But 48 89 0D <disp32> is RIP-relative. The disp32 must reach save area.
-    // The shellcode is at data_area+0x100, save area at data_area+0x00.
-    // Offset from RIP=shellcode_addr+save_instr_offset to save_area+offset
-    // We know: data_area+0x100 is shellcode start. Let's compute precise rip-relative offsets.
-    // For simplicity, just build all save instructions first, knowing shellcode_base = data_area + 0x100
-
-    // We need to compute RIP-relative offsets. The "next instruction" RIP after the instruction
-    // is used as base for the displacement.
-    // Let's just use absolute form via 48 8D modrm [SIB+disp32] pattern... actually that's for LEA.
-    // For MOV r64 to [mem], the form is:
-    // 48 89 0D <disp32>  = mov [rip+disp32], rcx  (7 bytes)
-    // 48 89 15 <disp32>  = mov [rip+disp32], rdx
-    // 4C 89 05 <disp32>  = mov [rip+disp32], r8
-    // 4C 89 0D <disp32>  = mov [rip+disp32], r9
-    // 4C 89 15 <disp32>  = mov [rip+disp32], r10
-    // 4C 89 1D <disp32>  = mov [rip+disp32], r11
-
-    // We build the shellcode and track offset to compute RIP-relative displacements
-    size_t sc_start = sc.size(); // = 10 (already have save_rax)
-    // Actually let me just precompute sizes and compute offsets in a second pass
-    // Or better: use the absolute form for all saves, like we did for rax.
-    // 48 A3 for rax, but there's no absolute form for rcx/rdx etc with 64-bit immediates as addresses.
-    // We need to use a different approach. Let me just use PUSH + POP to save to stack first,
-    // then use the private stack area for saving.
-    // Actually, the simplest correct approach: push all regs, then mov them from stack to save area.
-    // But that's more complex.
-
-    // Let me just use a different technique: compute rip offsets manually for each instruction.
-    // shellcode_base = data_area + 0x100
-    // After "mov [save_rax], rax" (10 bytes), RIP = shellcode_base + 10
-    // Next instruction: mov [rip+disp32], rcx -> disp32 = save_rcx - (shellcode_base + 10 + 7)
-    // where 7 = size of the instruction itself.
-
-    uintptr_t sc_base = data_area + 0x100;
-
-    auto add_mov_rip_rel = [&](uintptr_t target, uint8_t op_prefix, uint8_t modrm) {
-        // Current size = sc.size(), so RIP after this instruction = sc_base + sc.size() + 7
-        uintptr_t rip_after = sc_base + sc.size() + 7;
-        int32_t disp = (int32_t)(target - rip_after);
-        if(op_prefix) sc.push_back(op_prefix);
-        sc.push_back(0x89); sc.push_back(modrm);
-        for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp>>(i*8)));
-    };
-
-    // rcx: 48 89 0D disp32
-    add_mov_rip_rel(save_rcx, 0x48, 0x0D);
-    // rdx: 48 89 15 disp32
-    add_mov_rip_rel(save_rdx, 0x48, 0x15);
-    // r8:  4C 89 05 disp32
-    add_mov_rip_rel(save_r8,  0x4C, 0x05);
-    // r9:  4C 89 0D disp32
-    add_mov_rip_rel(save_r9,  0x4C, 0x0D);
-    // r10: 4C 89 15 disp32
-    add_mov_rip_rel(save_r10, 0x4C, 0x15);
-    // r11: 4C 89 1D disp32
-    add_mov_rip_rel(save_r11, 0x4C, 0x1D);
+    emit_mov_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
+    emit_mov_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
+    emit_mov_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
+    emit_mov_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
+    emit_mov_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
+    emit_mov_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
 
     // pushfq; pop [rip+disp32]
-    sc.push_back(0x9C); // pushfq
-    uintptr_t rip_after_popfq = sc_base + sc.size() + 7;
-    int32_t disp_rfl = (int32_t)(save_rfl - rip_after_popfq);
-    sc.push_back(0x8F); sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rfl>>(i*8)));
+    { uintptr_t ra = sc_base + sc.size() + 7;
+      sc.push_back(0x9C); i32 d=(i32)(save_rfl-ra); sc.push_back(0x8F); sc.push_back(0x05);
+      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
 
     // == SWITCH TO PRIVATE STACK ==
-    // mov rsp, priv_stack_top (48 BC imm64)
     sc.push_back(0x48); sc.push_back(0xBC);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(priv_stack_top>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(priv_stack>>(i*8)));
 
     // == CALL TlsAlloc ==
-    // sub rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
-    // mov rax, [addr_tlsa]; call rax
     sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
     sc.push_back(0xFF); sc.push_back(0xD0);
-    // add rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
 
-    // Write eax (TLS index) to [addr_idx] (4-byte DWORD)
-    // 89 05 disp32 = mov [rip+disp32], eax
-    uintptr_t rip_after_idx = sc_base + sc.size() + 6;
-    int32_t disp_idx = (int32_t)(addr_idx - rip_after_idx);
-    sc.push_back(0x89); sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_idx>>(i*8)));
+    // Write eax (TLS index) -> [addr_idx]
+    { uintptr_t ra = sc_base + sc.size() + 6;
+      i32 d=(i32)(addr_idx-ra); sc.push_back(0x89); sc.push_back(0x05);
+      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
 
-    // == CALL ENTRY POINT DllMainCRTStartup(dll_base, 1, NULL) ==
-    // sub rsp, 0x28
+    // == CALL DllMainCRTStartup(base, DLL_PROCESS_ATTACH, NULL) ==
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
-    // mov rcx, [addr_base]  (48 8B 0D disp32)
-    uintptr_t rip_after_base = sc_base + sc.size() + 7;
-    int32_t disp_base = (int32_t)(addr_base - rip_after_base);
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x0D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_base>>(i*8)));
-
-    // mov edx, 1
-    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    // xor r8d, r8d
-    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
-    // mov rax, [addr_entry]; call rax
     sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_entry>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_base>>(i*8)));
+    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0xC8);  // mov rcx, rax
+    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
+    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
+    sc.push_back(0x48); sc.push_back(0xA1);
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_entry>>(i*8)));
     sc.push_back(0xFF); sc.push_back(0xD0);
-    // add rsp, 0x28
     sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
 
     // == RESTORE ORIGINAL STACK ==
-    // mov rsp, [orig_rsp]
-    uintptr_t rip_after_rsp = sc_base + sc.size() + 7;
-    int32_t disp_rsp = (int32_t)(orig_rsp - rip_after_rsp);
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
+    { uintptr_t ra = sc_base + sc.size() + 7;
+      i32 d=(i32)(orig_rsp-ra); sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
+      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
 
     // == RESTORE REGISTERS ==
-    // mov rax, [save_rax]
     sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
 
-    // rcx: 48 8B 0D disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_rcx - rip_after_rsp);
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x0D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
-
-    // rdx: 48 8B 15 disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_rdx - rip_after_rsp);
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x15);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
-
-    // r8: 4C 8B 05 disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_r8 - rip_after_rsp);
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
-
-    // r9: 4C 8B 0D disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_r9 - rip_after_rsp);
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x0D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
-
-    // r10: 4C 8B 15 disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_r10 - rip_after_rsp);
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x15);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
-
-    // r11: 4C 8B 1D disp32
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_r11 - rip_after_rsp);
-    sc.push_back(0x4C); sc.push_back(0x8B); sc.push_back(0x1D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
+    emit_ld_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
+    emit_ld_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
+    emit_ld_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
+    emit_ld_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
+    emit_ld_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
+    emit_ld_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
 
     // push [save_rfl]; popfq
-    rip_after_rsp = sc_base + sc.size() + 7;
-    disp_rsp = (int32_t)(save_rfl - rip_after_rsp);
-    sc.push_back(0xFF); sc.push_back(0x35);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp_rsp>>(i*8)));
+    { uintptr_t ra = sc_base + sc.size() + 7;
+      i32 d=(i32)(save_rfl-ra); sc.push_back(0xFF); sc.push_back(0x35);
+      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
     sc.push_back(0x9D);
 
-    // == JUMP BACK TO ORIGINAL RIP ==
-    // ff 25 00 00 00 00 <orig_rip>
+    // == JMP TO ORIGINAL RIP ==
     sc.push_back(0xFF); sc.push_back(0x25);
     sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    for(int i=0;i<8;i++)sc.push_back((uint8_t)(orig_rip>>(i*8)));
+    for(int i=0;i<8;i++) sc.push_back((uint8_t)(orig_rip>>(i*8)));
 
     return sc;
 }
 
 bool inject_via_hijack(HANDLE p,DWORD pid,uintptr_t base,uintptr_t entry_rva,uintptr_t tls_idx_addr){
-    // Allocate 3 pages
-    LPVOID mem=VirtualAllocEx(p,nullptr,0x3000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    LPVOID mem=VirtualAllocEx(p,nullptr,0x4000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if(!mem){warn("Hijack alloc failed");return false;}
     uintptr_t da=(uintptr_t)mem;
 
     auto sc=build_hijack_shellcode(da);
 
-    // Patch data fields
     SIZE_T wr;
-    WriteProcessMemory(p,(LPVOID)(da+0x1000),&tls_idx_addr,8,&wr);  // addr_idx
-    WriteProcessMemory(p,(LPVOID)(da+0x1008),&base,8,&wr);          // addr_base
+    WriteProcessMemory(p,(LPVOID)(da+0x1000),&tls_idx_addr,8,&wr);
+    WriteProcessMemory(p,(LPVOID)(da+0x1008),&base,8,&wr);
     uintptr_t ea=base+entry_rva;
-    WriteProcessMemory(p,(LPVOID)(da+0x1010),&ea,8,&wr);            // addr_entry
+    WriteProcessMemory(p,(LPVOID)(da+0x1010),&ea,8,&wr);
     uintptr_t ta=(uintptr_t)TlsAlloc;
-    WriteProcessMemory(p,(LPVOID)(da+0x1018),&ta,8,&wr);            // addr_tlsa
+    WriteProcessMemory(p,(LPVOID)(da+0x1018),&ta,8,&wr);
 
-    // Write shellcode
     WriteProcessMemory(p,(LPVOID)(da+0x100),sc.data(),sc.size(),&wr);
 
     std::vector<DWORD> tids=get_threads(pid);
@@ -335,12 +229,10 @@ bool inject_via_hijack(HANDLE p,DWORD pid,uintptr_t base,uintptr_t entry_rva,uin
         CONTEXT ctx={};ctx.ContextFlags=CONTEXT_FULL;
         if(!GetThreadContext(h,&ctx)){ResumeThread(h);CloseHandle(h);continue;}
 
-        // Save orig RIP/RSP
         WriteProcessMemory(p,(LPVOID)(da+0x40),&ctx.Rip,8,&wr);
         WriteProcessMemory(p,(LPVOID)(da+0x48),&ctx.Rsp,8,&wr);
 
         info("Hijacking TID="+std::to_string(tid)+" RIP="+hex_str(ctx.Rip));
-
         ctx.Rip=da+0x100;
         if(SetThreadContext(h,&ctx)){
             ResumeThread(h);CloseHandle(h);
