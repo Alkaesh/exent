@@ -14,30 +14,30 @@ typedef int32_t i32;
 
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
 
-void die(const char* msg) { DWORD c=GetLastError(); std::cerr<<"[FATAL] "<<msg<<" (code="<<c<<")"<<std::endl; exit(1); }
-void info(const std::string& msg) { std::cout<<"[+] "<<msg<<std::endl; }
-void warn(const std::string& msg) { std::cout<<"[!] "<<msg<<std::endl; }
+void die(const char* msg){DWORD c=GetLastError();std::cerr<<"[FATAL] "<<msg<<" (code="<<c<<")"<<std::endl;exit(1);}
+void info(const std::string& msg){std::cout<<"[+] "<<msg<<std::endl;}
+void warn(const std::string& msg){std::cout<<"[!] "<<msg<<std::endl;}
 
-std::string hex_str(uintptr_t v) { char b[32]; snprintf(b,sizeof(b),"0x%llx",(unsigned long long)v); return std::string(b); }
+std::string hex_str(uintptr_t v){char b[32];snprintf(b,sizeof(b),"0x%llx",(unsigned long long)v);return std::string(b);}
 
-DWORD find_pid(const std::wstring& name) {
+DWORD find_pid(const std::wstring& name){
     HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
-    if(s==INVALID_HANDLE_VALUE) return 0;
+    if(s==INVALID_HANDLE_VALUE)return 0;
     PROCESSENTRY32W e{sizeof(e)};
     if(!Process32FirstW(s,&e)){CloseHandle(s);return 0;}
     do{if(_wcsicmp(e.szExeFile,name.c_str())==0){CloseHandle(s);return e.th32ProcessID;}}
-    while(Process32NextW(s,&e)); CloseHandle(s); return 0;
+    while(Process32NextW(s,&e));CloseHandle(s);return 0;
 }
 
-uintptr_t remote_module_base(DWORD pid,const std::string& nl) {
+uintptr_t remote_module_base(DWORD pid,const std::string& nl){
     HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
     if(s==INVALID_HANDLE_VALUE)return 0;
     MODULEENTRY32W e{sizeof(e)};
     if(!Module32FirstW(s,&e)){CloseHandle(s);return 0;}
     do{
-        std::string mn; for(int i=0;e.szModule[i];i++){char c=(char)(e.szModule[i]<128?e.szModule[i]:'?');mn.push_back((char)tolower(c));}
+        std::string mn;for(int i=0;e.szModule[i];i++){char c=(char)(e.szModule[i]<128?e.szModule[i]:'?');mn.push_back((char)tolower(c));}
         if(mn==nl){uintptr_t b=(uintptr_t)e.modBaseAddr;CloseHandle(s);return b;}
-    }while(Module32NextW(s,&e)); CloseHandle(s); return 0;
+    }while(Module32NextW(s,&e));CloseHandle(s);return 0;
 }
 
 const char* resolve_api_set(const char* n){
@@ -45,11 +45,12 @@ const char* resolve_api_set(const char* n){
     return n;
 }
 
-struct PeData{std::vector<uint8_t> raw; IMAGE_DOS_HEADER* dos; IMAGE_NT_HEADERS64* nt; IMAGE_SECTION_HEADER* sections; size_t image_size;};
+struct PeData{std::vector<uint8_t> raw;IMAGE_DOS_HEADER* dos;IMAGE_NT_HEADERS64* nt;IMAGE_SECTION_HEADER* sections;size_t image_size;};
 
 uintptr_t rva_to_ptr(DWORD rva,const PeData& pe){
     for(int i=0;i<pe.nt->FileHeader.NumberOfSections;i++){
-        auto& s=pe.sections[i]; if(rva>=s.VirtualAddress&&rva<s.VirtualAddress+s.Misc.VirtualSize)return rva-s.VirtualAddress+s.PointerToRawData;
+        auto& s=pe.sections[i];
+        if(rva>=s.VirtualAddress&&rva<s.VirtualAddress+s.Misc.VirtualSize)return rva-s.VirtualAddress+s.PointerToRawData;
     }
     if(rva<pe.nt->OptionalHeader.SizeOfHeaders)return rva;
     return rva;
@@ -83,130 +84,97 @@ std::vector<DWORD> get_threads(DWORD pid){
     if(s==INVALID_HANDLE_VALUE)return t;
     THREADENTRY32 e{sizeof(e)};
     if(Thread32First(s,&e)){do{if(e.th32OwnerProcessID==pid)t.push_back(e.th32ThreadID);}while(Thread32Next(s,&e));}
-    CloseHandle(s); return t;
+    CloseHandle(s);return t;
 }
 
 // ---- Shellcode helpers ----
 
-static void emit_mov_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
-    uintptr_t rip_after = sc_base + sc.size() + 7;
-    int32_t disp = (int32_t)(target - rip_after);
-    if(prefix) sc.push_back(prefix);
-    sc.push_back(0x89); sc.push_back(modrm);
-    for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
+static void emit_mov_rip_rel(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target,uint8_t prefix,uint8_t modrm){
+    int32_t disp=(int32_t)(target-(sc_base+sc.size()+7));
+    if(prefix)sc.push_back(prefix);sc.push_back(0x89);sc.push_back(modrm);
+    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp>>(i*8)));
 }
-
-static void emit_ld_rip_rel(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target, uint8_t prefix, uint8_t modrm) {
-    uintptr_t rip_after = sc_base + sc.size() + 7;
-    int32_t disp = (int32_t)(target - rip_after);
-    if(prefix) sc.push_back(prefix);
-    sc.push_back(0x8B); sc.push_back(modrm);
-    for(int i=0;i<4;i++) sc.push_back((uint8_t)(disp>>(i*8)));
+static void emit_ld_rip_rel(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target,uint8_t prefix,uint8_t modrm){
+    int32_t disp=(int32_t)(target-(sc_base+sc.size()+7));
+    if(prefix)sc.push_back(prefix);sc.push_back(0x8B);sc.push_back(modrm);
+    for(int i=0;i<4;i++)sc.push_back((uint8_t)(disp>>(i*8)));
 }
-
-static void emit_eax_to_rip(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
-    uintptr_t rip_after = sc_base + sc.size() + 6;
-    int32_t d = (int32_t)(target - rip_after);
-    sc.push_back(0x89); sc.push_back(0x05);
-    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+static void emit_eax_to_rip(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
+    int32_t d=(int32_t)(target-(sc_base+sc.size()+6));
+    sc.push_back(0x89);sc.push_back(0x05);
+    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
 }
-
-static void emit_pushfq_pop_rip(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
+static void emit_pushfq_pop_rip(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
     sc.push_back(0x9C);
-    uintptr_t rip_after = sc_base + sc.size() + 7;
-    int32_t d = (int32_t)(target - rip_after);
-    sc.push_back(0x8F); sc.push_back(0x05);
-    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+    int32_t d=(int32_t)(target-(sc_base+sc.size()+7));
+    sc.push_back(0x8F);sc.push_back(0x05);
+    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
 }
-
-static void emit_push_rip_pop_rflags(std::vector<uint8_t>& sc, uintptr_t sc_base, uintptr_t target) {
-    uintptr_t rip_after = sc_base + sc.size() + 7;
-    int32_t d = (int32_t)(target - rip_after);
-    sc.push_back(0xFF); sc.push_back(0x35);
-    for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8)));
+static void emit_push_rip_pop_rflags(std::vector<uint8_t>& sc,uintptr_t sc_base,uintptr_t target){
+    int32_t d=(int32_t)(target-(sc_base+sc.size()+7));
+    sc.push_back(0xFF);sc.push_back(0x35);
+    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
     sc.push_back(0x9D);
 }
 
-std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area) {
-    uintptr_t save_rax  = data_area + 0x00;
-    uintptr_t save_rcx  = data_area + 0x08;
-    uintptr_t save_rdx  = data_area + 0x10;
-    uintptr_t save_r8   = data_area + 0x18;
-    uintptr_t save_r9   = data_area + 0x20;
-    uintptr_t save_r10  = data_area + 0x28;
-    uintptr_t save_r11  = data_area + 0x30;
-    uintptr_t save_rfl  = data_area + 0x38;
-    uintptr_t orig_rip  = data_area + 0x40;
-    uintptr_t orig_rsp  = data_area + 0x48;
-    uintptr_t addr_idx  = data_area + 0x1000;
-    uintptr_t addr_base = data_area + 0x1008;
-    uintptr_t addr_entry= data_area + 0x1010;
-    uintptr_t addr_tlsa = data_area + 0x1018;
-    uintptr_t priv_stack= data_area + 0x3000;
-    uintptr_t sc_base   = data_area + 0x100;
+std::vector<uint8_t> build_hijack_shellcode(uintptr_t data_area){
+    uintptr_t save_rax=data_area+0x00,save_rcx=data_area+0x08,save_rdx=data_area+0x10;
+    uintptr_t save_r8=data_area+0x18,save_r9=data_area+0x20,save_r10=data_area+0x28;
+    uintptr_t save_r11=data_area+0x30,save_rfl=data_area+0x38;
+    uintptr_t orig_rip=data_area+0x40,orig_rsp=data_area+0x48;
+    uintptr_t addr_idx=data_area+0x1000,addr_base=data_area+0x1008;
+    uintptr_t addr_entry=data_area+0x1010,addr_tlsa=data_area+0x1018;
+    uintptr_t priv_stack=data_area+0x3000,sc_base=data_area+0x100;
 
     std::vector<uint8_t> sc;
+    sc.push_back(0x48);sc.push_back(0xA3);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
+    emit_mov_rip_rel(sc,sc_base,save_rcx,0x48,0x0D);
+    emit_mov_rip_rel(sc,sc_base,save_rdx,0x48,0x15);
+    emit_mov_rip_rel(sc,sc_base,save_r8,0x4C,0x05);
+    emit_mov_rip_rel(sc,sc_base,save_r9,0x4C,0x0D);
+    emit_mov_rip_rel(sc,sc_base,save_r10,0x4C,0x15);
+    emit_mov_rip_rel(sc,sc_base,save_r11,0x4C,0x1D);
+    emit_pushfq_pop_rip(sc,sc_base,save_rfl);
 
-    // Save rax
-    sc.push_back(0x48); sc.push_back(0xA3);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
-    // Save rcx, rdx, r8-r11
-    emit_mov_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
-    emit_mov_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
-    emit_mov_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
-    emit_mov_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
-    emit_mov_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
-    emit_mov_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
-    // Save rflags
-    emit_pushfq_pop_rip(sc, sc_base, save_rfl);
+    sc.push_back(0x48);sc.push_back(0xBC);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(priv_stack>>(i*8)));
 
-    // Switch to private stack
-    sc.push_back(0x48); sc.push_back(0xBC);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(priv_stack>>(i*8)));
+    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xEC);sc.push_back(0x28);
+    sc.push_back(0x48);sc.push_back(0xA1);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
+    sc.push_back(0xFF);sc.push_back(0xD0);
+    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);
+    emit_eax_to_rip(sc,sc_base,addr_idx);
 
-    // TlsAlloc()
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
-    sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_tlsa>>(i*8)));
-    sc.push_back(0xFF); sc.push_back(0xD0);
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
-    // Store TLS index
-    emit_eax_to_rip(sc, sc_base, addr_idx);
+    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xEC);sc.push_back(0x28);
+    sc.push_back(0x48);sc.push_back(0xA1);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_base>>(i*8)));
+    sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0xC8);
+    sc.push_back(0xBA);sc.push_back(0x01);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
+    sc.push_back(0x45);sc.push_back(0x31);sc.push_back(0xC0);
+    sc.push_back(0x48);sc.push_back(0xA1);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(addr_entry>>(i*8)));
+    sc.push_back(0xFF);sc.push_back(0xD0);
+    sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);
 
-    // Call DllMainCRTStartup(base, DLL_PROCESS_ATTACH, NULL)
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xEC); sc.push_back(0x28);
-    sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_base>>(i*8)));
-    sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0xC8);
-    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
-    sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(addr_entry>>(i*8)));
-    sc.push_back(0xFF); sc.push_back(0xD0);
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
+    {i32 d=(i32)(orig_rsp-(sc_base+sc.size()+7));
+     sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x25);
+     for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));}
 
-    // Restore original stack
-    { i32 d=(i32)(orig_rsp-(sc_base+sc.size()+7));
-      sc.push_back(0x48); sc.push_back(0x8B); sc.push_back(0x25);
-      for(int i=0;i<4;i++) sc.push_back((uint8_t)(d>>(i*8))); }
+    sc.push_back(0x48);sc.push_back(0xA1);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(save_rax>>(i*8)));
+    emit_ld_rip_rel(sc,sc_base,save_rcx,0x48,0x0D);
+    emit_ld_rip_rel(sc,sc_base,save_rdx,0x48,0x15);
+    emit_ld_rip_rel(sc,sc_base,save_r8,0x4C,0x05);
+    emit_ld_rip_rel(sc,sc_base,save_r9,0x4C,0x0D);
+    emit_ld_rip_rel(sc,sc_base,save_r10,0x4C,0x15);
+    emit_ld_rip_rel(sc,sc_base,save_r11,0x4C,0x1D);
+    emit_push_rip_pop_rflags(sc,sc_base,save_rfl);
 
-    // Restore rax
-    sc.push_back(0x48); sc.push_back(0xA1);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(save_rax>>(i*8)));
-    // Restore rcx,rdx,r8-r11
-    emit_ld_rip_rel(sc, sc_base, save_rcx, 0x48, 0x0D);
-    emit_ld_rip_rel(sc, sc_base, save_rdx, 0x48, 0x15);
-    emit_ld_rip_rel(sc, sc_base, save_r8,  0x4C, 0x05);
-    emit_ld_rip_rel(sc, sc_base, save_r9,  0x4C, 0x0D);
-    emit_ld_rip_rel(sc, sc_base, save_r10, 0x4C, 0x15);
-    emit_ld_rip_rel(sc, sc_base, save_r11, 0x4C, 0x1D);
-    // Restore rflags
-    emit_push_rip_pop_rflags(sc, sc_base, save_rfl);
-
-    // Jump to original RIP
-    sc.push_back(0xFF); sc.push_back(0x25);
-    sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
-    for(int i=0;i<8;i++) sc.push_back((uint8_t)(orig_rip>>(i*8)));
+    sc.push_back(0xFF);sc.push_back(0x25);
+    sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
+    for(int i=0;i<8;i++)sc.push_back((uint8_t)(orig_rip>>(i*8)));
 
     return sc;
 }
@@ -256,36 +224,54 @@ bool inject_via_hijack(HANDLE p,DWORD pid,uintptr_t base,uintptr_t entry_rva,uin
     return false;
 }
 
+// ---- TLS setup ----
+// CRITICAL: Read TLS directory from PE FILE (pe.raw), NOT from remote memory.
+// After apply_relocs() the remote copy has absolute addresses. If we read from
+// remote and then do base+(addr-ImageBase) we double-apply the relocation.
+// By reading from the file, all fields are still VA (ImageBase-relative),
+// so our base+(field-ImageBase) computation is correct.
+
 bool setup_tls(HANDLE p,uintptr_t base,PeData& pe,uintptr_t* out_idx){
     IMAGE_DATA_DIRECTORY& td=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if(td.Size==0||td.VirtualAddress==0){info("TLS: none");*out_idx=0;return true;}
 
-    uintptr_t tda=base+td.VirtualAddress;
-    IMAGE_TLS_DIRECTORY64 tls;SIZE_T rd;
-    if(!ReadProcessMemory(p,(LPCVOID)tda,&tls,sizeof(tls),&rd)){warn("TLS: read fail");return false;}
+    // Read from PE FILE (not remote — relocs would mess up our math)
+    IMAGE_TLS_DIRECTORY64* tls=(IMAGE_TLS_DIRECTORY64*)(pe.raw.data()+rva_to_ptr(td.VirtualAddress,pe));
 
-    *out_idx=base+(tls.AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
-    info("TLS: index_addr="+hex_str(*out_idx));
+    if(!tls->StartAddressOfRawData){info("TLS: empty");
+        *out_idx=base+(tls->AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
+        return true;}
 
-    if(tls.StartAddressOfRawData==0){info("TLS: no data");return true;}
-
-    size_t ds=(size_t)(tls.EndAddressOfRawData-tls.StartAddressOfRawData);
-    size_t zs=tls.SizeOfZeroFill; size_t tot=ds+zs;
+    size_t ds=(size_t)(tls->EndAddressOfRawData-tls->StartAddressOfRawData);
+    size_t zs=tls->SizeOfZeroFill;size_t tot=ds+zs;
     info("TLS: data="+std::to_string(ds)+" zero="+std::to_string(zs)+" total="+std::to_string(tot));
+
+    // AddressOfIndex is a VA — convert to absolute address in mapped DLL
+    *out_idx=base+(tls->AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
+    info("TLS: index_addr="+hex_str(*out_idx)+" (file AddressOfIndex="+hex_str(tls->AddressOfIndex)+")");
 
     LPVOID blk=VirtualAllocEx(p,nullptr,tot,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     if(!blk){warn("TLS: alloc fail");return false;}
     uintptr_t bp=(uintptr_t)blk;
 
+    // Copy template from file
     if(ds>0){
-        std::vector<uint8_t> buf(ds);
-        uintptr_t src=base+(tls.StartAddressOfRawData-pe.nt->OptionalHeader.ImageBase);
-        if(ReadProcessMemory(p,(LPCVOID)src,buf.data(),ds,&rd)){SIZE_T wr;WriteProcessMemory(p,blk,buf.data(),ds,&wr);}
+        SIZE_T wr;
+        WriteProcessMemory(p,blk,pe.raw.data()+rva_to_ptr((DWORD)tls->StartAddressOfRawData,pe),ds,&wr);
     }
     if(zs>0){std::vector<uint8_t> z(zs,0);SIZE_T wr;WriteProcessMemory(p,(LPVOID)(bp+ds),z.data(),zs,&wr);}
 
-    IMAGE_TLS_DIRECTORY64 pt=tls; pt.StartAddressOfRawData=bp; pt.EndAddressOfRawData=bp+tot; pt.SizeOfZeroFill=0;
-    SIZE_T wr;WriteProcessMemory(p,(LPVOID)tda,&pt,sizeof(pt),&wr);
+    // NOW update the remote TLS directory with absolute addresses
+    uintptr_t tls_remote_addr=base+td.VirtualAddress;
+    IMAGE_TLS_DIRECTORY64 pt={};
+    pt.StartAddressOfRawData=bp;
+    pt.EndAddressOfRawData=bp+tot;
+    pt.SizeOfZeroFill=0;
+    pt.AddressOfIndex=*out_idx;       // keep the computed absolute address
+    pt.AddressOfCallBacks=base+(tls->AddressOfCallBacks-pe.nt->OptionalHeader.ImageBase);
+    pt.Characteristics=tls->Characteristics;
+    SIZE_T wr;WriteProcessMemory(p,(LPVOID)tls_remote_addr,&pt,sizeof(pt),&wr);
+
     info("TLS: block @ "+hex_str(bp)+" ("+std::to_string(tot)+" bytes)");
     return true;
 }
@@ -297,7 +283,7 @@ bool resolve_imports(HANDLE p,DWORD pid,uintptr_t base,PeData& pe){
     while(desc->Name!=0){
         const char* dn=(const char*)(pe.raw.data()+rva_to_ptr(desc->Name,pe));
         const char* rn=resolve_api_set(dn);
-        std::string rl; for(const char*c=rn;*c;c++)rl.push_back((char)tolower(*c));
+        std::string rl;for(const char*c=rn;*c;c++)rl.push_back((char)tolower(*c));
         uintptr_t rdb=remote_module_base(pid,rl);
         if(!rdb){warn(std::string("Not in target: ")+dn);desc++;continue;}
         HMODULE hm=LoadLibraryA(rn);
@@ -315,14 +301,14 @@ bool resolve_imports(HANDLE p,DWORD pid,uintptr_t base,PeData& pe){
             WriteProcessMemory(p,(LPVOID)(base+(desc->FirstThunk+(uintptr_t)tk-(uintptr_t)(IMAGE_THUNK_DATA64*)(pe.raw.data()+rva_to_ptr(desc->FirstThunk,pe)))),&rf,sizeof(rf),&wr);
             og++;tk++;
         }
-        FreeLibrary(hm); if(ur>0)warn(std::to_string(ur)+" unresolved"); desc++;
+        FreeLibrary(hm);if(ur>0)warn(std::to_string(ur)+" unresolved");desc++;
     }
     return true;
 }
 
 bool apply_relocs(HANDLE p,uintptr_t base,PeData& pe){
-    uintptr_t pref=pe.nt->OptionalHeader.ImageBase; if(base==pref)return true;
-    intptr_t delta=(intptr_t)(base-pref); info("Relocs: delta="+hex_str((uintptr_t)delta));
+    uintptr_t pref=pe.nt->OptionalHeader.ImageBase;if(base==pref)return true;
+    intptr_t delta=(intptr_t)(base-pref);info("Relocs: delta="+hex_str((uintptr_t)delta));
     auto& dir=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if(dir.Size==0){warn("No .reloc");return false;}
     auto* blk=(IMAGE_BASE_RELOCATION*)(pe.raw.data()+rva_to_ptr(dir.VirtualAddress,pe));
@@ -338,7 +324,7 @@ bool apply_relocs(HANDLE p,uintptr_t base,PeData& pe){
         }
         blk=(IMAGE_BASE_RELOCATION*)((uint8_t*)blk+blk->SizeOfBlock);
     }
-    info("Relocs applied"); return true;
+    info("Relocs applied");return true;
 }
 
 void protect_sections(HANDLE p,uintptr_t base,PeData& pe){
@@ -363,7 +349,7 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
 
     LPVOID mem=VirtualAllocEx(p,nullptr,pe.image_size,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if(!mem){die("VirtualAllocEx");CloseHandle(p);return false;}
-    uintptr_t base=(uintptr_t)mem; info("Mapped @ "+hex_str(base));
+    uintptr_t base=(uintptr_t)mem;info("Mapped @ "+hex_str(base));
 
     SIZE_T wr;
     WriteProcessMemory(p,mem,pe.raw.data(),pe.nt->OptionalHeader.SizeOfHeaders,&wr);
@@ -386,7 +372,6 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
     info("Thread hijacking (TlsAlloc + private stack + register safe)...");
     if(inject_via_hijack(p,pid,base,entry,tls_idx_addr)){
         info("SUCCESS! DLL @ "+hex_str(base));
-        info("DllMain runs on private stack, thread restored after.");
         info("Log: %TEMP%\\luna_extracted\\"+std::to_string(pid)+"\\runtime.log");
         CloseHandle(p);return true;
     }
@@ -408,7 +393,7 @@ bool is_x64_dll(const std::wstring& p){
 
 bool is_x64_process(DWORD pid){
     HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
-    if(!h)return false; BOOL w=FALSE;IsWow64Process(h,&w);CloseHandle(h);return !w;
+    if(!h)return false;BOOL w=FALSE;IsWow64Process(h,&w);CloseHandle(h);return !w;
 }
 
 int wmain(int argc,wchar_t* argv[]){
