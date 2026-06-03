@@ -54,7 +54,7 @@ uintptr_t rva_to_ptr(DWORD rva, const PeData& pe) {
 }
 
 bool load_pe(const std::wstring& path, PeData& pe) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(path.c_str(), std::ios::binary | std::ios::ate);
     if (!f) return false;
     size_t size = f.tellg();
     f.seekg(0);
@@ -73,17 +73,17 @@ bool load_pe(const std::wstring& path, PeData& pe) {
 std::vector<uint8_t> build_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) {
     uintptr_t dllmain = dll_base + dllmain_rva;
     std::vector<uint8_t> sc = {
-        0x48, 0x83, 0xEC, 0x28,                       // sub rsp, 0x28
-        0x48, 0xB9,                                   // mov rcx, imm64
+        0x48, 0x83, 0xEC, 0x28,
+        0x48, 0xB9,
     };
     for (int i = 0; i < 8; i++) sc.push_back((dll_base >> (i * 8)) & 0xFF);
-    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00); // mov edx, 1
-    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0); // xor r8d, r8d
-    sc.push_back(0x48); sc.push_back(0xB8);           // mov rax, imm64
+    sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
+    sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
+    sc.push_back(0x48); sc.push_back(0xB8);
     for (int i = 0; i < 8; i++) sc.push_back((dllmain >> (i * 8)) & 0xFF);
-    sc.push_back(0xFF); sc.push_back(0xD0);           // call rax
-    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28); // add rsp, 0x28
-    sc.push_back(0xC3);                               // ret
+    sc.push_back(0xFF); sc.push_back(0xD0);
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
+    sc.push_back(0xC3);
     return sc;
 }
 
@@ -125,7 +125,7 @@ bool apply_relocs(HANDLE process, uintptr_t base, PeData& pe) {
     uintptr_t preferred = pe.nt->OptionalHeader.ImageBase;
     if (base == preferred) { info("No relocs needed"); return true; }
     intptr_t delta = (intptr_t)(base - preferred);
-    info("Relocs delta: " + std::to_string(delta));
+    info("Relocs delta: 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)delta); return b; }()));
 
     IMAGE_DATA_DIRECTORY& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (dir.Size == 0) { warn("No .reloc section"); return false; }
@@ -180,11 +180,10 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) { die("VirtualAllocEx"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
-    info("Allocated 0x" + std::to_string(pe.image_size) + " at 0x" + std::to_string(base));
+    info("Allocated at 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)base); return b; }()));
 
     SIZE_T wr;
     WriteProcessMemory(p, mem, pe.raw.data(), pe.nt->OptionalHeader.SizeOfHeaders, &wr);
-
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
         if (s.SizeOfRawData == 0) continue;
@@ -198,7 +197,7 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     protect_sections(p, base, pe);
 
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
-    if (entry == 0) { warn("No DllMain"); CloseHandle(p); return true; }
+    if (entry == 0) { warn("No DllMain (entry=0)"); CloseHandle(p); return true; }
 
     auto sc = build_shellcode(base, entry);
     LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -206,7 +205,7 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
 
     HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
-    if (!t) { die("CreateRemoteThread"); CloseHandle(p); return false; }
+    if (!t) { die("CreateRemoteThread for DllMain"); CloseHandle(p); return false; }
 
     info("DllMain thread running...");
     WaitForSingleObject(t, 15000);
@@ -215,13 +214,13 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
     CloseHandle(p);
 
-    info("DllMain returned " + std::to_string(ec));
-    info("DLL mapped at 0x" + std::to_string(base));
+    info("DllMain returned " + std::to_string(ec) + " (" + (ec ? "TRUE)" : "FALSE)"));
+    info("DLL mapped at 0x" + std::string([&]{ char b[32]; snprintf(b,sizeof(b),"%llx",(unsigned long long)base); return b; }()));
     return true;
 }
 
 bool is_x64_dll(const std::wstring& p) {
-    std::ifstream f(p, std::ios::binary);
+    std::ifstream f(p.c_str(), std::ios::binary);
     if (!f) return false;
     IMAGE_DOS_HEADER dos; f.read((char*)&dos, sizeof(dos));
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
