@@ -1,4 +1,4 @@
-# build.ps1 — Force 64-bit build with verification
+# build.ps1
 # Run: powershell -ExecutionPolicy Bypass -File build.ps1
 
 $Root = 'C:\Users\alga\Downloads\exent-main\exent-main'
@@ -15,26 +15,15 @@ if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
     Write-Host 'Compiler: MSVC' -ForegroundColor Green
 } elseif (Get-Command g++ -ErrorAction SilentlyContinue) {
     $compiler = 'mingw'
-    Write-Host 'Compiler: MinGW' -ForegroundColor Green
     $gppVer = & g++ --version 2>&1 | Select-Object -First 1
-    Write-Host "  $gppVer"
-    $testSrc = "$env:TEMP\_arch_test.cpp"
-    $testOut = "$env:TEMP\_arch_test.exe"
-    'int main(){return 0;}' | Out-File -Encoding ASCII $testSrc
-    & g++ -m64 $testSrc -o $testOut 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host 'ERROR: g++ does not support -m64!' -ForegroundColor Red
-        Write-Host 'You have 32-bit MinGW installed.' -ForegroundColor Red
-        Write-Host 'Download 64-bit MinGW from: https://winlibs.com/' -ForegroundColor Yellow
-        Write-Host 'Choose: GCC x86_64-posix-seh + LLVM' -ForegroundColor Yellow
-        Remove-Item $testSrc -Force -ErrorAction SilentlyContinue
-        exit 1
+    Write-Host "Compiler: MinGW - $gppVer" -ForegroundColor Green
+    $machine = & g++ -dumpmachine 2>&1
+    Write-Host "  Target: $machine"
+    if ($machine -match 'i686') {
+        Write-Host '  WARN: 32-bit compiler! 64-bit DLL may fail.' -ForegroundColor Red
     }
-    Remove-Item $testSrc, $testOut -Force -ErrorAction SilentlyContinue
-    Write-Host '  64-bit support: OK' -ForegroundColor Green
 } else {
     Write-Host 'ERROR: No compiler found!' -ForegroundColor Red
-    Write-Host 'Download: https://winlibs.com/ (x86_64-posix-seh)' -ForegroundColor Yellow
     exit 1
 }
 
@@ -49,7 +38,8 @@ if (-not (Test-Path "$Native\luna_extracted_native.cpp")) {
     exit 1
 }
 
-Write-Host '[1/2] Building DLL...'
+# === DLL ===
+Write-Host '[1/2] DLL...'
 if ($compiler -eq 'msvc') {
     cl /std:c++17 /EHsc /O2 /MD /DLL "$Native\luna_extracted_native.cpp" /link /OUT:"$Bin\luna_extracted_native.dll" /MACHINE:X64 2>&1
 } else {
@@ -57,17 +47,20 @@ if ($compiler -eq 'msvc') {
 }
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL' -ForegroundColor Red; exit 1 }
 
-$objResult = & objdump -f "$Bin\luna_extracted_native.dll" 2>&1 | Select-String 'architecture'
-Write-Host "  $objResult"
-if ($objResult -match 'i386') {
-    Write-Host '  ERROR: DLL built as 32-bit!' -ForegroundColor Red
-    Write-Host '  Your MinGW is 32-bit only. Install 64-bit version.' -ForegroundColor Red
-    Write-Host '  https://winlibs.com/ - choose x86_64-posix-seh' -ForegroundColor Yellow
+$arch = & objdump -f "$Bin\luna_extracted_native.dll" 2>&1 | Select-String 'architecture'
+Write-Host "  $($arch.Line.Trim())"
+if ($arch -match 'x86-64') {
+    Write-Host '  DLL: 64-bit OK' -ForegroundColor Green
+} elseif ($arch -match 'i386' -and $arch -notmatch 'x86-64') {
+    Write-Host '  ERROR: DLL is 32-bit!' -ForegroundColor Red
+    Write-Host '  Install 64-bit MinGW: https://winlibs.com/ (x86_64-posix-seh)' -ForegroundColor Yellow
     exit 1
+} else {
+    Write-Host '  DLL: OK' -ForegroundColor Green
 }
-Write-Host "  OK: $Bin\luna_extracted_native.dll" -ForegroundColor Green
 
-Write-Host '[2/2] Building injector...'
+# === INJECTOR ===
+Write-Host '[2/2] Injector...'
 if ($compiler -eq 'msvc') {
     cl /std:c++17 /EHsc /O2 "$Native\injector.cpp" /link /OUT:"$Bin\injector_cli.exe" /MACHINE:X64 2>&1
 } else {
@@ -75,16 +68,16 @@ if ($compiler -eq 'msvc') {
 }
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL' -ForegroundColor Red; exit 1 }
 
-$objResult = & objdump -f "$Bin\injector_cli.exe" 2>&1 | Select-String 'architecture'
-Write-Host "  $objResult"
-if ($objResult -match 'i386') {
-    Write-Host '  ERROR: Built as 32-bit!' -ForegroundColor Red; exit 1
+$arch = & objdump -f "$Bin\injector_cli.exe" 2>&1 | Select-String 'architecture'
+Write-Host "  $($arch.Line.Trim())"
+if ($arch -match 'x86-64') {
+    Write-Host '  Injector: 64-bit OK' -ForegroundColor Green
+} elseif ($arch -match 'i386' -and $arch -notmatch 'x86-64') {
+    Write-Host '  ERROR: 32-bit!' -ForegroundColor Red; exit 1
+} else {
+    Write-Host '  Injector: OK' -ForegroundColor Green
 }
-Write-Host "  OK: $Bin\injector_cli.exe" -ForegroundColor Green
 
 Write-Host ''
 Write-Host '=== DONE ===' -ForegroundColor Green
-Write-Host ''
-Write-Host 'Run:' -ForegroundColor White
-Write-Host '  python src\python\custom_injector.py --process RobloxPlayerBeta --check-arch' -ForegroundColor Yellow
-Write-Host '  .\bin\injector_cli.exe .\bin\luna_extracted_native.dll --process RobloxPlayerBeta.exe' -ForegroundColor Yellow
+Write-Host 'Run: .\bin\injector_cli.exe .\bin\luna_extracted_native.dll --process RobloxPlayerBeta.exe' -ForegroundColor Yellow
