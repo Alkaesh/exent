@@ -41,31 +41,23 @@ DWORD find_pid(const std::wstring& name) {
     CloseHandle(s); return 0;
 }
 
-// Find module base in REMOTE process
 uintptr_t remote_module_base(DWORD pid, const std::string& name_lower) {
     HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (s == INVALID_HANDLE_VALUE) return 0;
     MODULEENTRY32W e{sizeof(e)};
     if (!Module32FirstW(s, &e)) { CloseHandle(s); return 0; }
     do {
-        // Convert szModule to narrow for comparison
         std::string mod_name;
         for (int i = 0; e.szModule[i]; i++) {
             char c = (char)(e.szModule[i] < 128 ? e.szModule[i] : '?');
             mod_name.push_back((char)tolower(c));
         }
-        if (mod_name == name_lower) {
-            uintptr_t base = (uintptr_t)e.modBaseAddr;
-            CloseHandle(s);
-            return base;
-        }
+        if (mod_name == name_lower) { uintptr_t b = (uintptr_t)e.modBaseAddr; CloseHandle(s); return b; }
     } while (Module32NextW(s, &e));
     CloseHandle(s); return 0;
 }
 
-// Map api-ms-win-crt-* names to real DLL names loaded in target
 const char* resolve_api_set(const char* name) {
-    // On Windows 11, api-ms-win-crt-* are API sets that forward to ucrtbase.dll
     if (strstr(name, "api-ms-win-crt-") || strstr(name, "api-ms-win-core-"))
         return "ucrtbase.dll";
     if (strstr(name, "api-ms-win-eventing-"))
@@ -107,10 +99,10 @@ bool load_pe(const std::wstring& path, PeData& pe) {
     return true;
 }
 
-std::vector<uint8_t> build_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) {
-    uintptr_t dllmain = dll_base + dllmain_rva;
+std::vector<uint8_t> build_shellcode(uintptr_t dl, uintptr_t dllmain_rva) {
+    uintptr_t dllmain = dl + dllmain_rva;
     std::vector<uint8_t> sc = { 0x48, 0x83, 0xEC, 0x28, 0x48, 0xB9 };
-    for (int i = 0; i < 8; i++) sc.push_back((dll_base >> (i*8)) & 0xFF);
+    for (int i = 0; i < 8; i++) sc.push_back((dl >> (i*8)) & 0xFF);
     sc.push_back(0xBA); sc.push_back(0x01); sc.push_back(0x00); sc.push_back(0x00); sc.push_back(0x00);
     sc.push_back(0x45); sc.push_back(0x31); sc.push_back(0xC0);
     sc.push_back(0x48); sc.push_back(0xB8);
@@ -121,97 +113,76 @@ std::vector<uint8_t> build_shellcode(uintptr_t dll_base, uintptr_t dllmain_rva) 
     return sc;
 }
 
-bool resolve_imports(HANDLE process, DWORD pid, uintptr_t base, PeData& pe) {
-    IMAGE_DATA_DIRECTORY& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
+    auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir.Size == 0) { info("No imports"); return true; }
-
     auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
     while (desc->Name != 0) {
-        const char* dll_name = (const char*)(pe.raw.data() + rva_to_ptr(desc->Name, pe));
-        const char* real_name = resolve_api_set(dll_name);
-
-        // Convert to lowercase for comparison
-        std::string real_lower;
-        for (const char* p = real_name; *p; p++) real_lower.push_back((char)tolower(*p));
-
-        // Find this DLL in the TARGET process
-        uintptr_t remote_dll_base = remote_module_base(pid, real_lower);
-        if (!remote_dll_base) {
-            warn(std::string("DLL not in target: ") + dll_name + " (resolved: " + real_name + ")");
-            desc++;
-            continue;
-        }
-
-        // Load locally just to get export addresses
-        HMODULE hMod = LoadLibraryA(real_name);
-        if (!hMod) { warn(std::string("Cannot load locally: ") + real_name); desc++; continue; }
-
-        info(std::string("Imports: ") + dll_name + " -> " + real_name + " @ " + hex_str(remote_dll_base));
-
-        auto* thunk = (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe));
-        auto* orig = desc->OriginalFirstThunk
-            ? (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->OriginalFirstThunk, pe)) : thunk;
-        uintptr_t local_base = (uintptr_t)hMod;
-        int unresolved = 0;
-
-        while (orig->u1.AddressOfData != 0) {
-            uintptr_t local_func_addr = 0;
-            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
-                local_func_addr = (uintptr_t)GetProcAddress(hMod, MAKEINTRESOURCEA(orig->u1.Ordinal & 0xFFFF));
-            } else {
-                auto* nb = (IMAGE_IMPORT_BY_NAME*)(pe.raw.data() + rva_to_ptr((DWORD)orig->u1.AddressOfData, pe));
-                local_func_addr = (uintptr_t)GetProcAddress(hMod, nb->Name);
+        const char* dn = (const char*)(pe.raw.data() + rva_to_ptr(desc->Name, pe));
+        const char* rn = resolve_api_set(dn);
+        std::string rl;
+        for (const char* c = rn; *c; c++) rl.push_back((char)tolower(*c));
+        uintptr_t rdb = remote_module_base(pid, rl);
+        if (!rdb) { warn(std::string("Not in target: ") + dn); desc++; continue; }
+        HMODULE hm = LoadLibraryA(rn);
+        if (!hm) { warn(std::string("Can't load: ") + rn); desc++; continue; }
+        info(std::string("Imports: ") + dn + " -> " + rn + " @ " + hex_str(rdb));
+        auto* tk = (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe));
+        auto* og = desc->OriginalFirstThunk
+            ? (IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->OriginalFirstThunk, pe)) : tk;
+        uintptr_t lb = (uintptr_t)hm;
+        int ur = 0;
+        while (og->u1.AddressOfData != 0) {
+            uintptr_t lf = 0;
+            if (og->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
+                lf = (uintptr_t)GetProcAddress(hm, MAKEINTRESOURCEA(og->u1.Ordinal & 0xFFFF));
+            else {
+                auto* nb = (IMAGE_IMPORT_BY_NAME*)(pe.raw.data() + rva_to_ptr((DWORD)og->u1.AddressOfData, pe));
+                lf = (uintptr_t)GetProcAddress(hm, nb->Name);
             }
-
-            // Compute remote address: remote_base + (local_func - local_base)
-            uintptr_t remote_func_addr = 0;
-            if (local_func_addr)
-                remote_func_addr = remote_dll_base + (local_func_addr - local_base);
-            else
-                unresolved++;
-
-            uintptr_t remote_iata = base + (desc->FirstThunk + (uintptr_t)thunk
+            uintptr_t rf = lf ? (rdb + (lf - lb)) : 0;
+            if (!lf) ur++;
+            uintptr_t ri = base + (desc->FirstThunk + (uintptr_t)tk
                 - (uintptr_t)(IMAGE_THUNK_DATA64*)(pe.raw.data() + rva_to_ptr(desc->FirstThunk, pe)));
             SIZE_T wr;
-            WriteProcessMemory(process, (LPVOID)remote_iata, &remote_func_addr, sizeof(remote_func_addr), &wr);
-            orig++; thunk++;
+            WriteProcessMemory(p, (LPVOID)ri, &rf, sizeof(rf), &wr);
+            og++; tk++;
         }
-        FreeLibrary(hMod);
-        if (unresolved > 0) warn(std::to_string(unresolved) + " unresolved imports from " + dll_name);
+        FreeLibrary(hm);
+        if (ur > 0) warn(std::to_string(ur) + " unresolved from " + dn);
         desc++;
     }
     return true;
 }
 
-bool apply_relocs(HANDLE process, uintptr_t base, PeData& pe) {
-    uintptr_t preferred = pe.nt->OptionalHeader.ImageBase;
-    if (base == preferred) { info("No relocs needed"); return true; }
-    intptr_t delta = (intptr_t)(base - preferred);
+bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe) {
+    uintptr_t pref = pe.nt->OptionalHeader.ImageBase;
+    if (base == pref) { info("No relocs"); return true; }
+    intptr_t delta = (intptr_t)(base - pref);
     info("Relocs delta: " + hex_str((uintptr_t)delta));
-    IMAGE_DATA_DIRECTORY& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (dir.Size == 0) { warn("No .reloc section"); return false; }
-    auto* block = (IMAGE_BASE_RELOCATION*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
-    uint8_t* end = pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe) + dir.Size;
-    while ((uint8_t*)block < end && block->SizeOfBlock > 0) {
-        DWORD cnt = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-        WORD* entries = (WORD*)(block + 1);
+    auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (dir.Size == 0) { warn("No .reloc"); return false; }
+    auto* blk = (IMAGE_BASE_RELOCATION*)(pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe));
+    uint8_t* en = pe.raw.data() + rva_to_ptr(dir.VirtualAddress, pe) + dir.Size;
+    while ((uint8_t*)blk < en && blk->SizeOfBlock > 0) {
+        DWORD cnt = (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        WORD* e = (WORD*)(blk + 1);
         for (DWORD i = 0; i < cnt; i++) {
-            WORD type = entries[i] >> 12, off = entries[i] & 0xFFF;
-            if (type != IMAGE_REL_BASED_DIR64) continue;
-            uintptr_t addr = base + block->VirtualAddress + off;
-            uintptr_t val = 0; SIZE_T rd;
-            ReadProcessMemory(process, (LPCVOID)addr, &val, sizeof(val), &rd);
-            val += delta;
+            if ((e[i] >> 12) != IMAGE_REL_BASED_DIR64) continue;
+            uintptr_t a = base + blk->VirtualAddress + (e[i] & 0xFFF);
+            uintptr_t v = 0; SIZE_T rd;
+            ReadProcessMemory(p, (LPCVOID)a, &v, sizeof(v), &rd);
+            v += delta;
             SIZE_T wr;
-            WriteProcessMemory(process, (LPVOID)addr, &val, sizeof(val), &wr);
+            WriteProcessMemory(p, (LPVOID)a, &v, sizeof(v), &wr);
         }
-        block = (IMAGE_BASE_RELOCATION*)((uint8_t*)block + block->SizeOfBlock);
+        blk = (IMAGE_BASE_RELOCATION*)((uint8_t*)blk + blk->SizeOfBlock);
     }
     info("Relocs applied");
     return true;
 }
 
-void protect_sections(HANDLE process, uintptr_t base, PeData& pe) {
+void protect_sections(HANDLE p, uintptr_t base, PeData& pe) {
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
         if (s.SizeOfRawData == 0) continue;
@@ -221,7 +192,7 @@ void protect_sections(HANDLE process, uintptr_t base, PeData& pe) {
         else if (s.Characteristics & IMAGE_SCN_MEM_WRITE)
             prot = PAGE_READWRITE;
         DWORD old;
-        VirtualProtectEx(process, (LPVOID)(base + s.VirtualAddress), s.Misc.VirtualSize, prot, &old);
+        VirtualProtectEx(p, (LPVOID)(base + s.VirtualAddress), s.Misc.VirtualSize, prot, &old);
     }
 }
 
@@ -229,16 +200,13 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     PeData pe;
     if (!load_pe(dll_path, pe)) { std::cerr << "Bad PE" << std::endl; return false; }
     info("PE: " + std::to_string(pe.image_size) + " bytes, " + std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
-
     HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
     if (!p) { std::cerr << "OpenProcess failed — run as ADMIN!" << std::endl; return false; }
     info("Opened PID " + std::to_string(pid));
-
     LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) { die("VirtualAllocEx"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
     info("Allocated at " + hex_str(base));
-
     SIZE_T wr;
     WriteProcessMemory(p, mem, pe.raw.data(), pe.nt->OptionalHeader.SizeOfHeaders, &wr);
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
@@ -248,37 +216,28 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
             pe.raw.data() + s.PointerToRawData, s.SizeOfRawData, &wr);
     }
     info("Sections mapped");
-
     apply_relocs(p, base, pe);
-    resolve_imports(p, pid, base, pe);  // NOW WITH TARGET PID for remote base lookup
+    resolve_imports(p, pid, base, pe);
     protect_sections(p, base, pe);
-
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
     if (entry == 0) { warn("No DllMain"); CloseHandle(p); return true; }
     info("DllMain RVA: " + hex_str(entry));
-
     auto sc = build_shellcode(base, entry);
     LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!sc_mem) { die("Shellcode alloc"); CloseHandle(p); return false; }
     WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-
     HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
-    if (!t) { die("CreateRemoteThread for DllMain"); CloseHandle(p); return false; }
-
+    if (!t) { die("CreateRemoteThread"); CloseHandle(p); return false; }
     info("DllMain thread running...");
     WaitForSingleObject(t, 15000);
     DWORD ec; GetExitCodeThread(t, &ec);
     CloseHandle(t);
     VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
     CloseHandle(p);
-
-    if (ec == 1) {
-        info("DllMain returned TRUE — DLL initialized successfully!");
-    } else {
-        warn("DllMain returned " + std::to_string(ec) + " (0x" + std::string([&]{
-            char b[16]; snprintf(b, sizeof(b), "%X", ec); return b;
-        }()) + ") — may have failed. Check runtime.log.");
-    }
+    if (ec == 1)
+        info("DllMain returned TRUE — initialized!");
+    else
+        warn("DllMain returned " + std::to_string(ec) + " (" + hex_str(ec) + ") — check runtime.log");
     info("DLL mapped at " + hex_str(base));
     return true;
 }
@@ -305,7 +264,7 @@ bool is_x64_process(DWORD pid) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3) {
-        std::wcout << L"Manual Map Injector (bypasses Byfron)\n\n"
+        std::wcout << L"Manual Map Injector\n\n"
                    << L"Usage: manual_map.exe <dll> --pid <id>\n"
                    << L"       manual_map.exe <dll> --process <name>\n";
         return 1;
@@ -313,8 +272,8 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring dll; DWORD pid = 0; std::wstring pname;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
-        if (a == L"--pid" && i + 1 < argc) pid = _wtoi(argv[++i]);
-        else if (a == L"--process" && i + 1 < argc) pname = argv[++i];
+        if (a == L"--pid" && i+1 < argc) pid = _wtoi(argv[++i]);
+        else if (a == L"--process" && i+1 < argc) pname = argv[++i];
         else if (dll.empty()) dll = argv[i];
     }
     if (dll.empty()) { std::cerr << "DLL required" << std::endl; return 1; }
@@ -332,8 +291,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (d64 != p64) { std::cerr << "MISMATCH!" << std::endl; return 1; }
     std::wcout << L"  OK" << std::endl;
 
-    std::wcout << L"\nManual mapping into PID " << pid << std::endl;
+    std::wcout << L"\nManual mapping PID " << pid << std::endl;
     if (!manual_map(pid, dll)) { std::cerr << "\nFailed." << std::endl; return 1; }
-    std::cout << "\nDONE! Check: %TEMP%\\luna_extracted\\" << pid << "\\runtime.log" << std::endl;
+    std::cout << "\nDONE! %TEMP%\\luna_extracted\\" << pid << "\\runtime.log" << std::endl;
     return 0;
 }
