@@ -23,16 +23,16 @@ if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
 }
 
 Write-Host ''
-Write-Host '[1/2] DLL (dynamic UCRT, static GCC/winpthread)...'
+Write-Host '[1/2] DLL (dynamic UCRT, fully static MinGW runtime)...'
 
 if ($compiler -eq 'msvc') {
     cl /std:c++17 /EHsc /O2 /MD /DLL "$Native\luna_extracted_native.cpp" /link /OUT:"$Bin\luna_extracted_native.dll" /MACHINE:X64 2>&1
 } else {
+    # -static links libgcc, libstdc++ AND libwinpthread statically (no DLL deps from MinGW runtime)
     $gccArgs = @(
         '-std=c++17', '-O2', '-m64', '-shared',
         "$Native\luna_extracted_native.cpp",
-        '-static-libgcc', '-static-libstdc++',
-        '-Wl,-Bstatic', '-lwinpthread', '-Wl,-Bdynamic',
+        '-static',
         '-o', "$Bin\luna_extracted_native.dll"
     )
     & g++ @gccArgs 2>&1
