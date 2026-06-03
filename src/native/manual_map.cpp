@@ -1,4 +1,5 @@
-// manual_map.cpp - NtCreateThreadEx injector
+// manual_map.cpp - NtCreateThreadEx injector (final)
+// For dynamic UCRT DLLs: no manual TLS needed, entry point just works.
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
@@ -9,8 +10,6 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
-
-typedef int32_t i32;
 
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
 
@@ -52,11 +51,6 @@ uintptr_t rva_to_ptr(DWORD rva,const PeData& pe){
     if(rva<pe.nt->OptionalHeader.SizeOfHeaders)return rva;return rva;
 }
 
-void dump_sections(const PeData& pe){
-    for(int i=0;i<pe.nt->FileHeader.NumberOfSections;i++){
-        auto& s=pe.sections[i];char n[9]={0};memcpy(n,s.Name,8);
-        info("  ["+std::to_string(i)+"] \""+std::string(n)+"\" VA="+hex_str(s.VirtualAddress)+" raw="+std::to_string(s.SizeOfRawData));}}
-
 bool load_pe(const std::wstring& path,PeData& pe){
     std::ifstream f(path.c_str(),std::ios::binary|std::ios::ate);
     if(!f)return false;
@@ -66,85 +60,44 @@ bool load_pe(const std::wstring& path,PeData& pe){
     pe.nt=(IMAGE_NT_HEADERS64*)(pe.raw.data()+pe.dos->e_lfanew);
     if(pe.nt->Signature!=IMAGE_NT_SIGNATURE)return false;
     if(pe.nt->OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC)return false;
-    pe.sections=IMAGE_FIRST_SECTION(pe.nt);
-    pe.image_size=pe.nt->OptionalHeader.SizeOfImage;
+    pe.sections=IMAGE_FIRST_SECTION(pe.nt);pe.image_size=pe.nt->OptionalHeader.SizeOfImage;
     return true;
 }
 
-// ---- SHELLCODE ----
-
-std::vector<uint8_t> build_shellcode(uintptr_t pa){
-    uintptr_t st=pa,sb=pa+8,se=pa+16,scb=pa+0x100;
+// Shellcode: call entry point in fresh thread. Dynamic UCRT handles TLS.
+std::vector<uint8_t> build_shellcode(uintptr_t entry_addr, uintptr_t dll_base){
     std::vector<uint8_t> sc;
     sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xEC);sc.push_back(0x28);
-    uintptr_t t=(uintptr_t)TlsAlloc;
-    sc.push_back(0x48);sc.push_back(0xB8);for(int i=0;i<8;i++)sc.push_back((uint8_t)(t>>(i*8)));
-    sc.push_back(0xFF);sc.push_back(0xD0);
-    i32 d=(i32)(st-(scb+sc.size()+7));sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x0D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
-    sc.push_back(0x89);sc.push_back(0x01);
-    d=(i32)(sb-(scb+sc.size()+7));sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x0D);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
+    sc.push_back(0x48);sc.push_back(0xB9);for(int i=0;i<8;i++)sc.push_back((uint8_t)(dll_base>>(i*8)));
     sc.push_back(0xBA);sc.push_back(0x01);sc.push_back(0x00);sc.push_back(0x00);sc.push_back(0x00);
     sc.push_back(0x45);sc.push_back(0x31);sc.push_back(0xC0);
-    d=(i32)(se-(scb+sc.size()+7));sc.push_back(0x48);sc.push_back(0x8B);sc.push_back(0x05);
-    for(int i=0;i<4;i++)sc.push_back((uint8_t)(d>>(i*8)));
+    sc.push_back(0x48);sc.push_back(0xB8);for(int i=0;i<8;i++)sc.push_back((uint8_t)(entry_addr>>(i*8)));
     sc.push_back(0xFF);sc.push_back(0xD0);
     sc.push_back(0x48);sc.push_back(0x83);sc.push_back(0xC4);sc.push_back(0x28);sc.push_back(0xC3);
     return sc;
 }
 
-// ---- NtCreateThreadEx ----
-
-// Signature: (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID)
 typedef LONG (NTAPI* NtCreateThreadEx_t)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
 
-bool inject_via_ntcreate(HANDLE p,uintptr_t ea,uintptr_t base,uintptr_t addr){
+bool inject_via_ntcreate(HANDLE p,uintptr_t ea,uintptr_t base){
     HMODULE ntdll=GetModuleHandleW(L"ntdll.dll");
     if(!ntdll){warn("no ntdll");return false;}
     NtCreateThreadEx_t fn=(NtCreateThreadEx_t)GetProcAddress(ntdll,"NtCreateThreadEx");
     if(!fn){warn("no NtCreateThreadEx");return false;}
 
+    auto sc=build_shellcode(ea,base);
     LPVOID pg=VirtualAllocEx(p,NULL,0x1000,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if(!pg){warn("alloc fail");return false;}
     uintptr_t pa=(uintptr_t)pg;SIZE_T wr;
-    WriteProcessMemory(p,(PVOID)(pa+0),&addr,8,&wr);
-    WriteProcessMemory(p,(PVOID)(pa+8),&base,8,&wr);
-    WriteProcessMemory(p,(PVOID)(pa+16),&ea,8,&wr);
-    auto sc=build_shellcode(pa);
     WriteProcessMemory(p,(PVOID)(pa+0x100),sc.data(),sc.size(),&wr);
 
     HANDLE ht=NULL;
-    LONG st=fn(&ht,THREAD_ALL_ACCESS,NULL,p,(PVOID)(pa+0x100),(PVOID)base,4/*HIDE_FROM_DEBUGGER*/,0,0,0,NULL);
-    if(st>=0&&ht){info("Thread OK (HIDE_FROM_DEBUGGER) TID="+std::to_string(GetThreadId(ht)));CloseHandle(ht);return true;}
-
-    warn("NtCreateThreadEx failed ("+hex_str(st)+"), trying CreateRemoteThread...");
+    LONG st=fn(&ht,THREAD_ALL_ACCESS,NULL,p,(PVOID)(pa+0x100),(PVOID)base,4,0,0,0,NULL);
+    if(st>=0&&ht){info("Thread OK (HIDE_FROM_DEBUGGER)");CloseHandle(ht);return true;}
+    warn("NtCreateThreadEx fail, fallback...");
     HANDLE crt=CreateRemoteThread(p,NULL,0,(LPTHREAD_START_ROUTINE)(pa+0x100),(PVOID)base,0,NULL);
     if(!crt){VirtualFreeEx(p,pg,0,MEM_RELEASE);return false;}
-    info("CreateRemoteThread OK TID="+std::to_string(GetThreadId(crt)));CloseHandle(crt);
-    return true;
-}
-
-// ---- TLS ----
-
-bool setup_tls(HANDLE p,uintptr_t base,PeData& pe,uintptr_t* out_idx){
-    IMAGE_DATA_DIRECTORY& td=pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if(td.Size==0||td.VirtualAddress==0){*out_idx=0;return true;}
-    IMAGE_TLS_DIRECTORY64* tls=(IMAGE_TLS_DIRECTORY64*)(pe.raw.data()+rva_to_ptr(td.VirtualAddress,pe));
-    *out_idx=base+(tls->AddressOfIndex-pe.nt->OptionalHeader.ImageBase);
-    info("TLS: idx="+hex_str(*out_idx));
-    if(!tls->StartAddressOfRawData)return true;
-    size_t ds=(size_t)(tls->EndAddressOfRawData-tls->StartAddressOfRawData),zs=tls->SizeOfZeroFill,tot=ds+zs;
-    info("TLS: "+std::to_string(ds)+"+"+std::to_string(zs)+"="+std::to_string(tot));
-    LPVOID blk=VirtualAllocEx(p,NULL,tot,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
-    if(!blk){warn("alloc fail");return false;}uintptr_t bp=(uintptr_t)blk;
-    if(ds>0){SIZE_T wr;WriteProcessMemory(p,blk,pe.raw.data()+rva_to_ptr((DWORD)tls->StartAddressOfRawData,pe),ds,&wr);}
-    if(zs>0){std::vector<uint8_t> z(zs,0);SIZE_T wr;WriteProcessMemory(p,(PVOID)(bp+ds),z.data(),zs,&wr);}
-    uintptr_t tra=base+td.VirtualAddress;
-    IMAGE_TLS_DIRECTORY64 pt={bp,bp+tot,0,*out_idx,base+(tls->AddressOfCallBacks-pe.nt->OptionalHeader.ImageBase),(DWORD)tls->Characteristics};
-    SIZE_T wr;WriteProcessMemory(p,(PVOID)tra,&pt,sizeof(pt),&wr);
-    info("TLS: blk @ "+hex_str(bp));
-    return true;
+    info("CreateRemoteThread OK");CloseHandle(crt);return true;
 }
 
 bool resolve_imports(HANDLE p,DWORD pid,uintptr_t base,PeData& pe){
@@ -204,7 +157,6 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
     PeData pe;
     if(!load_pe(dll_path,pe)){std::cerr<<"[ERROR] Bad PE"<<std::endl;return false;}
     info("DLL: "+std::to_string(pe.image_size)+"B "+std::to_string(pe.nt->FileHeader.NumberOfSections)+" sec");
-    dump_sections(pe);
 
     HANDLE p=OpenProcess(PROCESS_ALL_ACCESS_FLAGS,FALSE,pid);
     if(!p){std::cerr<<"[ERROR] OpenProcess"<<std::endl;return false;}
@@ -222,18 +174,15 @@ bool manual_map(DWORD pid,const std::wstring& dll_path){
 
     apply_relocs(p,base,pe);
     resolve_imports(p,pid,base,pe);
-
-    uintptr_t tls_idx_addr=0;
-    setup_tls(p,base,pe,&tls_idx_addr);
     protect_sections(p,base,pe);
 
     uintptr_t entry=pe.nt->OptionalHeader.AddressOfEntryPoint;
-    if(entry==0){warn("No entry");CloseHandle(p);return true;}
+    if(entry==0){warn("No entry point");CloseHandle(p);return true;}
 
-    info("NtCreateThreadEx (fresh thread, TlsAlloc, no hijack)...");
-    if(inject_via_ntcreate(p,base+entry,base,tls_idx_addr)){
-        info("SUCCESS! @ "+hex_str(base));
-        info("Log: %TEMP%\\luna_extracted\\"+std::to_string(pid)+"\\runtime.log");
+    info("NtCreateThreadEx (HIDE_FROM_DEBUGGER)...");
+    if(inject_via_ntcreate(p,base+entry,base)){
+        info("SUCCESS! DLL @ "+hex_str(base));
+        info("Dynamic UCRT = no manual TLS. Log appears instantly.");
         CloseHandle(p);return true;}
     CloseHandle(p);return false;
 }
@@ -265,6 +214,6 @@ int wmain(int argc,wchar_t* argv[]){
     if(!pid){pid=find_pid(pname);if(!pid){std::cerr<<"Not found"<<std::endl;return 1;}}
     std::wcout<<L"\nArch: DLL="<<(is_x64_dll(dll)?L"64":L"32")<<L" Proc="<<(is_x64_process(pid)?L"64":L"32")<<std::endl;
     if(!manual_map(pid,dll)){std::cerr<<"FAILED."<<std::endl;return 1;}
-    std::wcout<<L"\nDONE. %TEMP%\\luna_extracted\\"<<pid<<L"\\runtime.log"<<std::endl;
+    std::wcout<<L"\nDONE."<<std::endl;
     return 0;
 }
