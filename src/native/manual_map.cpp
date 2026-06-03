@@ -113,6 +113,70 @@ std::vector<uint8_t> build_shellcode(uintptr_t dl, uintptr_t dllmain_rva) {
     return sc;
 }
 
+// Build shellcode that calls a single function (for CRT init calls)
+std::vector<uint8_t> build_call_shellcode(uintptr_t fn_addr) {
+    std::vector<uint8_t> sc = {
+        0x48, 0x83, 0xEC, 0x28
+    };
+    sc.push_back(0x48); sc.push_back(0xB8);
+    for (int i = 0; i < 8; i++) sc.push_back((fn_addr >> (i*8)) & 0xFF);
+    sc.push_back(0xFF); sc.push_back(0xD0);
+    sc.push_back(0x48); sc.push_back(0x83); sc.push_back(0xC4); sc.push_back(0x28);
+    sc.push_back(0xC3);
+    return sc;
+}
+
+// Call CRT init functions (.init_array / .ctors) in the remote process.
+// This is REQUIRED for C++ DLLs that use global objects (std::string, std::atomic, etc.).
+// Without this, global constructors never run and the DLL crashes with
+// "basic_string: construction from null is not valid" or similar.
+bool call_crt_init(HANDLE p, uintptr_t base, PeData& pe) {
+    for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
+        auto& s = pe.sections[i];
+        char name[9] = {0};
+        memcpy(name, s.Name, 8);
+
+        bool is_init = (strcmp(name, ".init_array") == 0);
+        bool is_ctors = (strcmp(name, ".ctors") == 0);
+        if (!is_init && !is_ctors) continue;
+
+        size_t count = s.SizeOfRawData / sizeof(uintptr_t);
+        if (count == 0) break;
+
+        uintptr_t* entries = (uintptr_t*)(pe.raw.data() + s.PointerToRawData);
+
+        info(std::string("Init: ") + name + " (" + std::to_string(count) + " entries)");
+
+        for (size_t j = 0; j < count; j++) {
+            uintptr_t fn_rva = entries[j];
+            if (fn_rva == 0 || fn_rva == (uintptr_t)-1) continue;
+
+            uintptr_t fn_addr = base + fn_rva;
+            auto sc = build_call_shellcode(fn_addr);
+
+            LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
+                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!sc_mem) continue;
+
+            SIZE_T wr;
+            WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
+
+            HANDLE t = CreateRemoteThread(p, nullptr, 0,
+                (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
+            if (t) {
+                WaitForSingleObject(t, 5000);
+                CloseHandle(t);
+            }
+            VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+        }
+
+        info(std::string(name) + " processed");
+        return true;
+    }
+    warn("No .init_array / .ctors section — CRT init skipped");
+    return false;
+}
+
 bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
     auto& dir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir.Size == 0) { info("No imports"); return true; }
@@ -218,6 +282,12 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
     info("Sections mapped");
     apply_relocs(p, base, pe);
     resolve_imports(p, pid, base, pe);
+
+    // CRT init: call global constructors BEFORE DllMain
+    // This is critical for C++ DLLs — without it, std::string, std::atomic,
+    // and other global objects will be uninitialized and crash.
+    call_crt_init(p, base, pe);
+
     protect_sections(p, base, pe);
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
     if (entry == 0) { warn("No DllMain"); CloseHandle(p); return true; }
