@@ -1,7 +1,7 @@
 # build.ps1
 # Run: powershell -ExecutionPolicy Bypass -File build.ps1
 
-$Root = 'C:\Users\alga\Downloads\exent-main\exent-main'
+$Root = $PSScriptRoot
 $Native = "$Root\src\native"
 $Bin = "$Root\bin"
 
@@ -30,7 +30,7 @@ Write-Host '[1/2] DLL (static GCC, dynamic CRT)...'
 if ($compiler -eq 'msvc') {
     cl /std:c++17 /EHsc /O2 /MT /DLL "$Native\luna_extracted_native.cpp" /link /OUT:"$Bin\luna_extracted_native.dll" /MACHINE:X64 2>&1
 } else {
-    g++ -std=c++17 -O2 -m64 -shared "$Native\luna_extracted_native.cpp" -static-libgcc -static-libstdc++ -Wl,--exclude-all-symbols -o "$Bin\luna_extracted_native.dll" 2>&1
+    g++ -std=c++17 -O2 -m64 -shared "$Native\luna_extracted_native.cpp" -static-libgcc -static-libstdc++ -o "$Bin\luna_extracted_native.dll" 2>&1
 }
 if ($LASTEXITCODE -ne 0) { Write-Host 'DLL FAIL' -ForegroundColor Red; exit 1 }
 Write-Host '  DLL: OK' -ForegroundColor Green
