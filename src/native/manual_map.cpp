@@ -2,6 +2,7 @@
 // Compile: g++ -std=c++17 -O2 -m64 -municode manual_map.cpp -static -o manual_map.exe
 
 #include <windows.h>
+#include <winternl.h>
 #include <tlhelp32.h>
 #include <cstdint>
 #include <string>
@@ -11,6 +12,35 @@
 #include <filesystem>
 
 static const DWORD PROCESS_ALL_ACCESS_FLAGS = 0x001F0FFF;
+
+// NtCreateThreadEx for stealth thread creation (bypasses Byfron CreateRemoteThread hook)
+typedef NTSTATUS (NTAPI* NtCreateThreadEx_t)(
+    PHANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE ProcessHandle,
+    PVOID StartAddress,
+    PVOID Parameter,
+    ULONG CreateFlags,
+    SIZE_T ZeroBits,
+    SIZE_T StackSize,
+    SIZE_T MaximumStackSize,
+    PVOID AttributeList
+);
+
+static NtCreateThreadEx_t pNtCreateThreadEx = nullptr;
+
+HANDLE create_remote_thread_stealth(HANDLE process, PVOID start, PVOID param) {
+    if (!pNtCreateThreadEx) {
+        pNtCreateThreadEx = (NtCreateThreadEx_t)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx");
+        if (!pNtCreateThreadEx) return nullptr;
+    }
+    HANDLE hThread = nullptr;
+    NTSTATUS status = pNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, nullptr,
+        process, start, param, 0, 0, 0, 0, nullptr);
+    return (status >= 0) ? hThread : nullptr;
+}
 
 void die(const std::string& msg) {
     DWORD code = GetLastError();
@@ -83,6 +113,29 @@ uintptr_t rva_to_ptr(DWORD rva, const PeData& pe) {
     return rva;
 }
 
+// Safe section name extractor — IMAGE_SECTION_HEADER.Name is 8 bytes with no null guarantee
+std::string get_section_name(IMAGE_SECTION_HEADER& s) {
+    char name[9] = {0};
+    memcpy(name, s.Name, 8);
+    return std::string(name);
+}
+
+bool section_name_is(const IMAGE_SECTION_HEADER& s, const char* name) {
+    size_t len = strlen(name);
+    if (len > 8) len = 8;
+    return memcmp(s.Name, name, len) == 0 && (len == 8 || s.Name[len] == 0);
+}
+
+void dump_sections(const PeData& pe) {
+    info("Sections: " + std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
+    for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
+        std::string name = get_section_name(pe.sections[i]);
+        info("  [" + std::to_string(i) + "] " + name +
+             " VA=0x" + hex_str(pe.sections[i].VirtualAddress) +
+             " size=" + std::to_string(pe.sections[i].SizeOfRawData));
+    }
+}
+
 bool load_pe(const std::wstring& path, PeData& pe) {
     std::ifstream f(path.c_str(), std::ios::binary | std::ios::ate);
     if (!f) return false;
@@ -99,6 +152,7 @@ bool load_pe(const std::wstring& path, PeData& pe) {
     return true;
 }
 
+// Build shellcode that calls DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)
 std::vector<uint8_t> build_shellcode(uintptr_t dl, uintptr_t dllmain_rva) {
     uintptr_t dllmain = dl + dllmain_rva;
     std::vector<uint8_t> sc = { 0x48, 0x83, 0xEC, 0x28, 0x48, 0xB9 };
@@ -115,9 +169,7 @@ std::vector<uint8_t> build_shellcode(uintptr_t dl, uintptr_t dllmain_rva) {
 
 // Build shellcode that calls a single function (for CRT init calls)
 std::vector<uint8_t> build_call_shellcode(uintptr_t fn_addr) {
-    std::vector<uint8_t> sc = {
-        0x48, 0x83, 0xEC, 0x28
-    };
+    std::vector<uint8_t> sc = { 0x48, 0x83, 0xEC, 0x28 };
     sc.push_back(0x48); sc.push_back(0xB8);
     for (int i = 0; i < 8; i++) sc.push_back((fn_addr >> (i*8)) & 0xFF);
     sc.push_back(0xFF); sc.push_back(0xD0);
@@ -126,55 +178,64 @@ std::vector<uint8_t> build_call_shellcode(uintptr_t fn_addr) {
     return sc;
 }
 
-// Call CRT init functions (.init_array / .ctors) in the remote process.
-// This is REQUIRED for C++ DLLs that use global objects (std::string, std::atomic, etc.).
-// Without this, global constructors never run and the DLL crashes with
-// "basic_string: construction from null is not valid" or similar.
+// Execute a single remote function via stealth thread
+bool call_remote_fn(HANDLE p, uintptr_t fn_addr) {
+    auto sc = build_call_shellcode(fn_addr);
+    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!sc_mem) return false;
+
+    SIZE_T wr;
+    WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
+
+    HANDLE t = create_remote_thread_stealth(p, sc_mem, nullptr);
+    if (t) {
+        WaitForSingleObject(t, 5000);
+        CloseHandle(t);
+    }
+    VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+    return t != nullptr;
+}
+
+// Call CRT init functions in the remote process.
+// Handles .init_array, .ctors, and .CRT$XC* sections used by various compilers.
 bool call_crt_init(HANDLE p, uintptr_t base, PeData& pe) {
+    bool found = false;
+
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
         auto& s = pe.sections[i];
-        char name[9] = {0};
-        memcpy(name, s.Name, 8);
+        std::string name = get_section_name(s);
 
-        bool is_init = (strcmp(name, ".init_array") == 0);
-        bool is_ctors = (strcmp(name, ".ctors") == 0);
-        if (!is_init && !is_ctors) continue;
+        bool is_init_array = section_name_is(s, ".init_array");
+        bool is_ctors = section_name_is(s, ".ctors");
+        // MinGW puts CRT init functions in sections like .CRT$XCA, .CRT$XCZ etc.
+        bool is_crt_xc = (name.size() >= 6 && name.substr(0, 6) == ".CRT$X");
+
+        if (!is_init_array && !is_ctors && !is_crt_xc) continue;
 
         size_t count = s.SizeOfRawData / sizeof(uintptr_t);
-        if (count == 0) break;
+        if (count == 0) continue;
 
         uintptr_t* entries = (uintptr_t*)(pe.raw.data() + s.PointerToRawData);
 
-        info(std::string("Init: ") + name + " (" + std::to_string(count) + " entries)");
+        info(std::string("Init found: \"") + name + "\" (" + std::to_string(count) + " entries)");
 
         for (size_t j = 0; j < count; j++) {
             uintptr_t fn_rva = entries[j];
             if (fn_rva == 0 || fn_rva == (uintptr_t)-1) continue;
 
             uintptr_t fn_addr = base + fn_rva;
-            auto sc = build_call_shellcode(fn_addr);
-
-            LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!sc_mem) continue;
-
-            SIZE_T wr;
-            WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-
-            HANDLE t = CreateRemoteThread(p, nullptr, 0,
-                (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
-            if (t) {
-                WaitForSingleObject(t, 5000);
-                CloseHandle(t);
-            }
-            VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
+            info("  Calling constructor @ " + hex_str(fn_addr) + " (RVA " + hex_str(fn_rva) + ")");
+            call_remote_fn(p, fn_addr);
         }
-
-        info(std::string(name) + " processed");
-        return true;
+        found = true;
     }
-    warn("No .init_array / .ctors section — CRT init skipped");
-    return false;
+
+    if (!found) {
+        warn("No .init_array / .ctors / .CRT$XC* section — CRT init skipped");
+        warn("The DLL entry point (DllMainCRTStartup) should handle CRT init internally");
+    }
+    return found;
 }
 
 bool resolve_imports(HANDLE p, DWORD pid, uintptr_t base, PeData& pe) {
@@ -263,14 +324,20 @@ void protect_sections(HANDLE p, uintptr_t base, PeData& pe) {
 bool manual_map(DWORD pid, const std::wstring& dll_path) {
     PeData pe;
     if (!load_pe(dll_path, pe)) { std::cerr << "Bad PE" << std::endl; return false; }
-    info("PE: " + std::to_string(pe.image_size) + " bytes, " + std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
+    info("PE: " + std::to_string(pe.image_size) + " bytes, " +
+         std::to_string(pe.nt->FileHeader.NumberOfSections) + " sections");
+
+    dump_sections(pe);
+
     HANDLE p = OpenProcess(PROCESS_ALL_ACCESS_FLAGS, FALSE, pid);
     if (!p) { std::cerr << "OpenProcess failed — run as ADMIN!" << std::endl; return false; }
     info("Opened PID " + std::to_string(pid));
+
     LPVOID mem = VirtualAllocEx(p, nullptr, pe.image_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) { die("VirtualAllocEx"); CloseHandle(p); return false; }
     uintptr_t base = (uintptr_t)mem;
     info("Allocated at " + hex_str(base));
+
     SIZE_T wr;
     WriteProcessMemory(p, mem, pe.raw.data(), pe.nt->OptionalHeader.SizeOfHeaders, &wr);
     for (int i = 0; i < pe.nt->FileHeader.NumberOfSections; i++) {
@@ -280,34 +347,53 @@ bool manual_map(DWORD pid, const std::wstring& dll_path) {
             pe.raw.data() + s.PointerToRawData, s.SizeOfRawData, &wr);
     }
     info("Sections mapped");
+
     apply_relocs(p, base, pe);
     resolve_imports(p, pid, base, pe);
 
     // CRT init: call global constructors BEFORE DllMain
-    // This is critical for C++ DLLs — without it, std::string, std::atomic,
-    // and other global objects will be uninitialized and crash.
     call_crt_init(p, base, pe);
 
     protect_sections(p, base, pe);
+
     uintptr_t entry = pe.nt->OptionalHeader.AddressOfEntryPoint;
-    if (entry == 0) { warn("No DllMain"); CloseHandle(p); return true; }
-    info("DllMain RVA: " + hex_str(entry));
+    if (entry == 0) { warn("No entry point"); CloseHandle(p); return true; }
+    info("Entry point RVA: " + hex_str(entry));
+
+    // Use NtCreateThreadEx instead of CreateRemoteThread to bypass Byfron hooks
     auto sc = build_shellcode(base, entry);
-    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    LPVOID sc_mem = VirtualAllocEx(p, nullptr, sc.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!sc_mem) { die("Shellcode alloc"); CloseHandle(p); return false; }
     WriteProcessMemory(p, sc_mem, sc.data(), sc.size(), &wr);
-    HANDLE t = CreateRemoteThread(p, nullptr, 0, (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
+
+    HANDLE t = create_remote_thread_stealth(p, sc_mem, nullptr);
+    if (!t) {
+        warn("NtCreateThreadEx failed, falling back to CreateRemoteThread");
+        t = CreateRemoteThread(p, nullptr, 0,
+            (LPTHREAD_START_ROUTINE)sc_mem, nullptr, 0, nullptr);
+    }
     if (!t) { die("CreateRemoteThread"); CloseHandle(p); return false; }
-    info("DllMain thread running...");
+
+    info("Entry point thread running...");
     WaitForSingleObject(t, 15000);
     DWORD ec; GetExitCodeThread(t, &ec);
     CloseHandle(t);
     VirtualFreeEx(p, sc_mem, 0, MEM_RELEASE);
     CloseHandle(p);
-    if (ec == 1)
-        info("DllMain returned TRUE — initialized!");
-    else
-        warn("DllMain returned " + std::to_string(ec) + " (" + hex_str(ec) + ") — check runtime.log");
+
+    if (ec == 1 || ec == 0)
+        info("Entry returned " + std::to_string(ec) + " — initialized!");
+    else {
+        warn("Entry returned " + std::to_string(ec) + " (" + hex_str(ec) + ")");
+        if (ec == 0xC000071C || ec == 0xC0000428) {
+            warn("This looks like an anti-cheat block (Byfron/Hyperion).");
+            warn("Possible workarounds:");
+            warn("  1. Use a different injection method (SetWindowsHookEx, queue APC)");
+            warn("  2. Try thread hijacking instead of creating a new thread");
+            warn("  3. Check if Roblox updates patched this method");
+        }
+    }
     info("DLL mapped at " + hex_str(base));
     return true;
 }
@@ -352,7 +438,9 @@ int wmain(int argc, wchar_t* argv[]) {
         pid = find_pid(pname);
         if (!pid) { std::cerr << "Process not found" << std::endl; return 1; }
     }
-    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) { std::wcerr << L"DLL not found" << std::endl; return 1; }
+    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wcerr << L"DLL not found" << std::endl; return 1;
+    }
 
     std::wcout << L"\n=== Architecture ===" << std::endl;
     bool d64 = is_x64_dll(dll), p64 = is_x64_process(pid);
